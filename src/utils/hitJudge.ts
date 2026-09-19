@@ -453,7 +453,8 @@ export function computeHitResults(beatmap: BeatmapData, replay: ReplayData, modD
   const w50  = useLazerRules ? modDiff.hitWindow50U  : modDiff.hitWindow50;
   const hitRadius = modDiff.circleRadiusPx;
   const hitRadiusSq = hitRadius * hitRadius;
-  const fy = modDiff.isHR ? (y: number) => 384 - y : (y: number) => y;
+  const fx = modDiff.flipX ? (x: number) => 512 - x : (x: number) => x;
+  const fy = modDiff.flipY ? (y: number) => 384 - y : (y: number) => y;
 
   const cumTimes  = buildCumTimes(replay.frames);
   const keyPresses = buildKeyPresses(replay.frames, cumTimes);
@@ -481,7 +482,7 @@ export function computeHitResults(beatmap: BeatmapData, replay: ReplayData, modD
         type: 'circle',
         startTime: obj.time,
         endTime: obj.time,
-        x: obj.x - stackShift,
+        x: fx(obj.x) - stackShift,
         y: fy(obj.y) - stackShift,
         headResolved: false,
         headHit: false,
@@ -495,7 +496,7 @@ export function computeHitResults(beatmap: BeatmapData, replay: ReplayData, modD
         type: 'slider',
         startTime: obj.time,
         endTime: obj.time + slideDur * obj.slides,
-        x: obj.x - stackShift,
+        x: fx(obj.x) - stackShift,
         y: fy(obj.y) - stackShift,
         headResolved: false,
         headHit: false,
@@ -704,7 +705,7 @@ export function computeHitResults(beatmap: BeatmapData, replay: ReplayData, modD
       const raw = modDiff.isLazer
         ? sliderBallPosLazer(path, t, slider.time, slideDur, slider.slides)
         : sliderBallPos(path, t, slider.time, slideDur, slider.slides);
-      return { x: raw.x - stackShift, y: fy(raw.y) - stackShift };
+      return { x: fx(raw.x) - stackShift, y: fy(raw.y) - stackShift };
     };
     const stepTracking = (t: number, cx: number, cy: number, keysHeld: boolean): void => {
       const wasTracking = tracking;

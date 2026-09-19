@@ -3,19 +3,13 @@ import type { ModDifficulty } from '../utils/modDifficulty';
 import { sampleSlider } from './SliderGeometry';
 import { slideDurationMs } from '../utils/sliderDuration';
 import { type SpinnerAngleData, getSpinnerStateAt, spinnerProgress } from '../utils/hitJudge';
+import { CANVAS_W, CANVAS_H, SCALE, OFFSET_X, OFFSET_Y } from './playfield';
 
 const SPINNER_CENTER_X = 256;
 const SPINNER_CENTER_Y = 192;
 
-const PLAYFIELD_W = 512;
-const PLAYFIELD_H = 384;
-const CANVAS_W = 1280;
-const CANVAS_H = 720;
 
 // Fixed to original 800×600 reference so hit objects size is canvas-independent.
-const SCALE = Math.min(800 / PLAYFIELD_W, 600 / PLAYFIELD_H) * 0.9;
-const OFFSET_X = (CANVAS_W - PLAYFIELD_W * SCALE) / 2;
-const OFFSET_Y = (CANVAS_H - PLAYFIELD_H * SCALE) / 2;
 
 function toCanvas(x: number, y: number): [cx: number, cy: number] {
   return [OFFSET_X + x * SCALE, OFFSET_Y + y * SCALE];
@@ -186,17 +180,20 @@ function tintBitmap(bitmap: ImageBitmap, color: string): OffscreenCanvas {
   return osc;
 }
 
-// HR-flipped paths cached here only; non-HR is shared via sampleSlider.
-const _sliderPathsHR = new WeakMap<Slider, { x: number; y: number }[]>();
+// Reflected (HR / Mirror) paths cached here only; unflipped is shared via sampleSlider.
+// Reflecting the sampled path pointwise equals lazer's control-point reflection: every
+// curve type is reflection-equivariant and the expected distance is unchanged.
+const _sliderPathsFlipped = new WeakMap<Slider, { flipX: boolean; flipY: boolean; path: { x: number; y: number }[] }>();
 
-function getSliderPathForMod(slider: Slider, isHR: boolean): { x: number; y: number }[] {
-  if (!isHR) return sampleSlider(slider);
-  let path = _sliderPathsHR.get(slider);
-  if (path === undefined) {
-    const base = sampleSlider(slider);
-    path = base.map(p => ({ x: p.x, y: 384 - p.y }));
-    _sliderPathsHR.set(slider, path);
-  }
+function getSliderPathForMod(slider: Slider, flipX: boolean, flipY: boolean): { x: number; y: number }[] {
+  if (!flipX && !flipY) return sampleSlider(slider);
+  const cached = _sliderPathsFlipped.get(slider);
+  if (cached !== undefined && cached.flipX === flipX && cached.flipY === flipY) return cached.path;
+  const path = sampleSlider(slider).map(p => ({
+    x: flipX ? 512 - p.x : p.x,
+    y: flipY ? 384 - p.y : p.y,
+  }));
+  _sliderPathsFlipped.set(slider, { flipX, flipY, path });
   return path;
 }
 
@@ -371,8 +368,7 @@ interface Vis {
   frontDepth: number;
 }
 const _visible: Vis[] = [];
-const _bodyOrder: number[] = [];
-const _frontOrder: number[] = [];
+const _order: number[] = [];
 
 /**
  * Draw all osu!std hit objects (circles, sliders, spinners) visible at `timeMs` (beatmap ms),
@@ -396,7 +392,8 @@ export function drawHitObjects(
   const fadeIn  = modDiff.fadeInMs;
   const radius  = modDiff.circleRadiusPx * SCALE;
 
-  const fy = modDiff.isHR ? (y: number) => 384 - y : (y: number) => y;
+  const fx = modDiff.flipX ? (x: number) => 512 - x : (x: number) => x;
+  const fy = modDiff.flipY ? (y: number) => 384 - y : (y: number) => y;
   const isHD = modDiff.isHD;
   let firstObjIdx = 0;
   if (isHD) {
@@ -502,7 +499,7 @@ export function drawHitObjects(
       }
     }
 
-    const bodyDepth  = obj.type === 'slider' ? hitTime + slideDur * obj.slides : 0;
+    const bodyDepth  = obj.type === 'slider' ? hitTime + slideDur * obj.slides + 10 : 0;
     const frontDepth = obj.type === 'spinner' ? Number.POSITIVE_INFINITY : hitTime;
     visible.push({
       index: i,
@@ -516,74 +513,45 @@ export function drawHitObjects(
     });
   }
 
-  // ── Depth-sorted index arrays (Danser render-ordering rules) ──
-  // Pass 1 (bodies): only sliders, depth = endTime+10. Later-ending body draws
-  //   on top of earlier-ending body (correct for 2B overlapping sliders).
-  // Pass 2 (front layer): every visible object. Spinners depth = +∞ (always at
-  //   the back); circles and slider heads/balls depth = startTime, so earlier
-  //   start renders on top.
-  const bodyOrder  = _bodyOrder;
-  const frontOrder = _frontOrder;
-  bodyOrder.length  = 0;
-  frontOrder.length = 0;
+  // ── Single depth-sorted draw list (osu!stable ordering, as danser renders it) ──
+  // Every visible object has a front entry at depth = startTime (spinners +∞, always at the
+  // back); every slider also has a body entry at depth = endTime + 10. Drawn highest depth
+  // first, so earlier objects render on top of later ones, a slider body sits under everything
+  // that starts before the slider ends (its own head, 2B overlaps) but over circles that start
+  // after it ends, and a later-ending body covers an earlier-ending one. Approach circles are a
+  // separate final pass above every object. Entry encoding: v << 1 | isBody.
+  const order = _order;
+  order.length = 0;
   for (let v = 0; v < visible.length; v++) {
-    const obj = beatmap.hitObjects[visible[v]!.index]!;
-    if (obj.type === 'slider') bodyOrder.push(v);
-    frontOrder.push(v);
+    order.push(v << 1);
+    if (beatmap.hitObjects[visible[v]!.index]!.type === 'slider') order.push((v << 1) | 1);
   }
-  bodyOrder.sort((a, b) => visible[b]!.bodyDepth - visible[a]!.bodyDepth);
-  frontOrder.sort((a, b) => visible[b]!.frontDepth - visible[a]!.frontDepth);
+  order.sort((a, b) => {
+    const da = (a & 1) ? visible[a >> 1]!.bodyDepth : visible[a >> 1]!.frontDepth;
+    const db = (b & 1) ? visible[b >> 1]!.bodyDepth : visible[b >> 1]!.frontDepth;
+    if (da !== db) return db - da;
+    return (b & 1) - (a & 1); // equal depth: body behind front
+  });
 
-  // Slider bodies go on the bottom layer so later hit-circle overlap renders on top.
-  for (const v of bodyOrder) {
-    const { index, alpha, slideDur, color, wasHit } = visible[v]!;
+  for (const e of order) {
+    const { index, color, alpha, slideDur, comboNumber, wasHit } = visible[e >> 1]!;
     const obj = beatmap.hitObjects[index]!;
-    if (obj.type !== 'slider') continue;
 
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    const stackH = obj.stackHeight ?? 0;
-    if (stackH !== 0) ctx.translate(-stackH * radius / 10, -stackH * radius / 10);
-
-    const path = getSliderPathForMod(obj, modDiff.isHR);
-    const activeStart = obj.time;
-    const activeEnd   = obj.time + slideDur * obj.slides;
-
-    if (isHD) {
-      ctx.globalAlpha = Math.max(0, hdSliderBodyAlpha(timeMs, activeStart - preempt, preempt, activeEnd));
-    }
-
-    const trackColor = skin.config.sliderTrackOverride ?? color;
-    drawSliderBody(ctx, obj, path, radius, skin.config.sliderBorder, trackColor, modDiff.isHR, qualityTotal);
-
-    if (obj.slides > 1 && path.length >= 2) {
-      const lookback = Math.min(4, path.length - 2);
-
-      const tail    = path[path.length - 1]!;
-      const tailRef = path[path.length - 1 - lookback]!;
-      const [tx, ty] = toCanvas(tail.x, tail.y);
-
-      if (shouldShowTailArrow(obj.slides, timeMs, activeStart, slideDur)) {
-        const angle = Math.atan2(tailRef.y - tail.y, tailRef.x - tail.x);
-        drawRepeatArrow(ctx, tx, ty, angle, radius, color, skin.images, timeMs, curTpTime, curBeatLen);
+    if ((e & 1) === 1) {
+      if (obj.type !== 'slider') continue;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      const stackH = obj.stackHeight ?? 0;
+      if (stackH !== 0) ctx.translate(-stackH * radius / 10, -stackH * radius / 10);
+      if (isHD) {
+        ctx.globalAlpha = Math.max(0, hdSliderBodyAlpha(timeMs, obj.time - preempt, preempt, obj.time + slideDur * obj.slides));
       }
-
-      if (timeMs >= activeStart && shouldShowHeadArrow(obj.slides, timeMs, activeStart, slideDur)) {
-        const headRef = path[lookback]!;
-        const head    = path[0]!;
-        const [hax, hay] = toCanvas(head.x, head.y);
-        const angle = Math.atan2(headRef.y - head.y, headRef.x - head.x);
-        drawRepeatArrow(ctx, hax, hay, angle, radius, color, skin.images, timeMs, curTpTime, curBeatLen);
-      }
+      const path = getSliderPathForMod(obj, modDiff.flipX, modDiff.flipY);
+      const trackColor = skin.config.sliderTrackOverride ?? color;
+      drawSliderBody(ctx, obj, path, radius, skin.config.sliderBorder, trackColor, modDiff.flipX, modDiff.flipY, qualityTotal);
+      ctx.restore();
+      continue;
     }
-
-    ctx.restore();
-  }
-
-  // Back-to-front so earlier objects render on top of later approach circles (stable layering).
-  for (const v of frontOrder) {
-    const { index, color, alpha, slideDur, comboNumber, wasHit } = visible[v]!;
-    const obj = beatmap.hitObjects[index]!;
 
     ctx.save();
     ctx.globalAlpha = alpha;
@@ -594,16 +562,12 @@ export function drawHitObjects(
     }
 
     if (obj.type === 'circle') {
-      const [cx, cy] = toCanvas(obj.x, fy(obj.y));
+      const [cx, cy] = toCanvas(fx(obj.x), fy(obj.y));
 
       if (isHD) {
         if (alpha > 0) {
           drawCircle(ctx, cx, cy, radius, color, skin.images);
           drawComboNumber(ctx, cx, cy, radius, comboNumber, skin, circleInstafade);
-          if (timeMs < obj.time && index === firstObjIdx) {
-            const t = (obj.time - timeMs) / preempt;
-            drawApproachCircle(ctx, cx, cy, radius * (1 + 2 * t), color, skin.images);
-          }
         }
       } else if (wasHit && timeMs >= obj.time) {
         const dt = timeMs - obj.time;
@@ -615,18 +579,43 @@ export function drawHitObjects(
         // Combo number hard-cuts at hit time (required for instafade skins).
         if (timeMs < obj.time) {
           drawComboNumber(ctx, cx, cy, radius, comboNumber, skin, circleInstafade);
-          const t = (obj.time - timeMs) / preempt;
-          drawApproachCircle(ctx, cx, cy, radius * (1 + 2 * t), color, skin.images);
         }
       }
 
     } else if (obj.type === 'slider') {
-      const path = getSliderPathForMod(obj, modDiff.isHR);
-      const [hx, hy] = toCanvas(obj.x, fy(obj.y));
+      const path = getSliderPathForMod(obj, modDiff.flipX, modDiff.flipY);
+      const [hx, hy] = toCanvas(fx(obj.x), fy(obj.y));
       const activeStart = obj.time;
       const activeEnd   = obj.time + slideDur * obj.slides;
 
-      // Slider body and repeat arrows are drawn in pass 1.
+      // Repeat arrows live on the object layer (under this slider's head, over later objects)
+      // but share the body's alpha, including the HD body fade.
+      if (obj.slides > 1 && path.length >= 2) {
+        ctx.save();
+        if (isHD) {
+          ctx.globalAlpha = Math.max(0, hdSliderBodyAlpha(timeMs, activeStart - preempt, preempt, activeEnd));
+        }
+        const lookback = Math.min(4, path.length - 2);
+
+        const tail    = path[path.length - 1]!;
+        const tailRef = path[path.length - 1 - lookback]!;
+        const [tx, ty] = toCanvas(tail.x, tail.y);
+
+        if (shouldShowTailArrow(obj.slides, timeMs, activeStart, slideDur)) {
+          const angle = Math.atan2(tailRef.y - tail.y, tailRef.x - tail.x);
+          drawRepeatArrow(ctx, tx, ty, angle, radius, color, skin.images, timeMs, curTpTime, curBeatLen);
+        }
+
+        if (timeMs >= activeStart && shouldShowHeadArrow(obj.slides, timeMs, activeStart, slideDur)) {
+          const headRef = path[lookback]!;
+          const head    = path[0]!;
+          const [hax, hay] = toCanvas(head.x, head.y);
+          const angle = Math.atan2(headRef.y - head.y, headRef.x - head.x);
+          drawRepeatArrow(ctx, hax, hay, angle, radius, color, skin.images, timeMs, curTpTime, curBeatLen);
+        }
+        ctx.restore();
+      }
+
       if (timeMs < obj.time) {
         if (isHD) {
           const headAlpha = hdCircleAlpha(timeMs, obj.time - preempt, preempt);
@@ -635,17 +624,11 @@ export function drawHitObjects(
             ctx.globalAlpha = headAlpha;
             drawSliderHeadCircle(ctx, hx, hy, radius, color, skin.images);
             drawComboNumber(ctx, hx, hy, radius, comboNumber, skin, sliderHeadInstafade);
-            if (index === firstObjIdx) {
-              const t = (obj.time - timeMs) / preempt;
-              drawApproachCircle(ctx, hx, hy, radius * (1 + 2 * t), color, skin.images);
-            }
             ctx.restore();
           }
         } else {
           drawSliderHeadCircle(ctx, hx, hy, radius, color, skin.images);
           drawComboNumber(ctx, hx, hy, radius, comboNumber, skin, sliderHeadInstafade);
-          const t = (obj.time - timeMs) / preempt;
-          drawApproachCircle(ctx, hx, hy, radius * (1 + 2 * t), color, skin.images);
         }
       }
 
@@ -682,6 +665,27 @@ export function drawHitObjects(
       drawSpinner(ctx, skin.spinnerImages, timeMs, obj, cumAngle, progress, progress >= 1, skin, angleData?.bonusTimes ?? []);
     }
 
+    ctx.restore();
+  }
+
+  // ── Approach circles: a final pass above every hit object (stable/danser/lazer all do this). ──
+  // Same conditions as the head draw: pre-hit only; under HD only the first object's shows.
+  for (const e of order) {
+    if ((e & 1) === 1) continue;
+    const { index, color, alpha } = visible[e >> 1]!;
+    const obj = beatmap.hitObjects[index]!;
+    if (obj.type === 'spinner' || timeMs >= obj.time) continue;
+    if (isHD && index !== firstObjIdx) continue;
+    const acAlpha = isHD && obj.type === 'slider' ? hdCircleAlpha(timeMs, obj.time - preempt, preempt) : alpha;
+    if (acAlpha <= 0) continue;
+
+    ctx.save();
+    ctx.globalAlpha = acAlpha;
+    const stackH = obj.stackHeight ?? 0;
+    if (stackH !== 0) ctx.translate(-stackH * radius / 10, -stackH * radius / 10);
+    const [cx, cy] = toCanvas(fx(obj.x), fy(obj.y));
+    const t = (obj.time - timeMs) / preempt;
+    drawApproachCircle(ctx, cx, cy, radius * (1 + 2 * t), color, skin.images);
     ctx.restore();
   }
 }
@@ -821,7 +825,7 @@ function drawApproachCircle(
 }
 
 // Slider body cache: the body (border + dark interior + blurred glow) is fully
-// determined by (slider, radius, borderColor, isHR).  None of these change
+// determined by (slider, radius, borderColor, flipX, flipY).  None of these change
 // mid-session, so we build each body once into a tight-bbox offscreen and blit
 // it every frame.  Firefox's software-rasterised 2D filter/compositing path
 // makes the previous "rebuild every frame into a full 1280×720 offscreen"
@@ -838,7 +842,8 @@ interface CachedSliderBody {
   radius: number;    // cache key — rebuild if any of these change
   borderColor: string;
   trackColor: string;
-  isHR: boolean;
+  flipX: boolean;
+  flipY: boolean;
   quality: number;
 }
 const _sliderBodyCache = new WeakMap<Slider, CachedSliderBody>();
@@ -964,7 +969,8 @@ function drawSliderBody(
   radius: number,
   borderColor: string,
   trackColor: string,
-  isHR: boolean,
+  flipX: boolean,
+  flipY: boolean,
   quality: number,
 ): void {
   let cached = _sliderBodyCache.get(slider);
@@ -973,12 +979,13 @@ function drawSliderBody(
     cached.radius !== radius ||
     cached.borderColor !== borderColor ||
     cached.trackColor !== trackColor ||
-    cached.isHR !== isHR ||
+    cached.flipX !== flipX ||
+    cached.flipY !== flipY ||
     cached.quality !== quality
   ) {
     const built = buildSliderBody(path, radius, borderColor, trackColor, quality);
     if (built === null) return;
-    cached = { ...built, radius, borderColor, trackColor, isHR, quality };
+    cached = { ...built, radius, borderColor, trackColor, flipX, flipY, quality };
     _sliderBodyCache.set(slider, cached);
   }
   // bmp is quality× oversized; draw back at logical (w, h) so the main

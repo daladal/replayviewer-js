@@ -1,9 +1,8 @@
-import type { HitResult, SkinAssets } from '../types/index';
+import type { HitResult, SkinAssets, LazerMod } from '../types/index';
 import type { ScoreFrame } from '../utils/scoreProcessor';
+import { MOD_ICON_SPECS, composeModIcon, extendedModIconInfo, type LazerModIconTextures } from '../utils/modIcons';
 
 const CANVAS_W  = 1280;
-const SCALE     = Math.min(800 / 512, 600 / 384) * 0.9;
-const PLAYFIELD_RIGHT = (CANVAS_W - 512 * SCALE) / 2 + 512 * SCALE;
 
 const SCORE_RIGHT_X = CANVAS_W - 4;
 const SCORE_Y       = 4;
@@ -214,64 +213,67 @@ function drawScoreText(
   }
 }
 
-const MOD_STEMS: [number, string, string][] = [
-  [1 << 0,  'selection-mod-nofail',      'NF'],
-  [1 << 1,  'selection-mod-easy',         'EZ'],
-  [1 << 3,  'selection-mod-hidden',       'HD'],
-  [1 << 4,  'selection-mod-hardrock',     'HR'],
-  [1 << 5,  'selection-mod-suddendeath',  'SD'],
-  [1 << 6,  'selection-mod-doubletime',   'DT'],
-  [1 << 7,  'selection-mod-relax',        'RX'],
-  [1 << 8,  'selection-mod-halftime',     'HT'],
-  [1 << 9,  'selection-mod-nightcore',    'NC'],
-  [1 << 10, 'selection-mod-flashlight',   'FL'],
-  [1 << 12, 'selection-mod-spunout',      'SO'],
-  [1 << 20, 'selection-mod-fadein',       'FI'],  // mania
-  [1 << 30, 'selection-mod-mirror',       'MR'],  // mania
-];
+const MOD_ICON_SPEC_BY_ACRONYM = new Map(MOD_ICON_SPECS.map(spec => [spec.acronym, spec]));
 
 const MOD_ICON_H   = 30;
 const MOD_ICON_GAP = 2;
 const MOD_Y        = ACC_Y + ACC_DIGIT_H + 6;
 
+/** One slot of the HUD mod-icon row; `bitmap` undefined ⇒ labelled-pill fallback. */
+export interface ModIconSlot {
+  readonly acronym: string;
+  readonly bitmap: ImageBitmap | undefined;
+}
+
 /**
- * Draw the active-mod icon row under the accuracy readout (top-right). `mods` is the
- * legacy replay mod bitmask; DT is hidden when NC is set (NC implies DT). Uses the skin's
- * selection-mod-* sprites with a labelled-pill fallback.
+ * Resolve the mod-icon row for a score once (per renderer). `acronyms` comes from
+ * `activeModAcronyms`; `lazerMods` is the replay's lazer mod list (undefined for stable).
+ * Per mod: a mod with extended info (custom rate, single-setting DA) always gets osu!'s
+ * composed icon with the text extension, as lazer shows it; otherwise the skin's
+ * `selection-mod-*` sprite wins, then osu!'s plain composed icon, then the text pill.
  */
-export function drawModIcons(
-  ctx: CanvasRenderingContext2D,
-  mods: number,
-  skin?: SkinAssets,
-): void {
-  if (mods === 0) return;
-
-  const hasNC = (mods & (1 << 9)) !== 0;
-  const active: { stem: string; label: string }[] = [];
-  for (const [bit, stem, label] of MOD_STEMS) {
-    if ((mods & bit) === 0) continue;
-    if (bit === (1 << 6) && hasNC) continue;
-    active.push({ stem, label });
-  }
-  if (active.length === 0) return;
-
-  const modImg = (stem: string) =>
-    skin?.images.get(`${stem}@2x.png`) ?? skin?.images.get(`${stem}.png`);
-
-  const widths = active.map(({ stem }) => {
-    const bmp = modImg(stem);
-    return bmp ? (bmp.width / bmp.height) * MOD_ICON_H : MOD_ICON_H * 1.6;
+export function buildModIconRow(
+  acronyms: readonly string[],
+  lazerMods: readonly LazerMod[] | undefined,
+  skin: SkinAssets | undefined,
+  textures: LazerModIconTextures | null,
+): ModIconSlot[] {
+  return acronyms.map(acronym => {
+    const spec = MOD_ICON_SPEC_BY_ACRONYM.get(acronym);
+    const lazerMod = lazerMods?.find(m => m.acronym === acronym);
+    const extended = lazerMod !== undefined ? extendedModIconInfo(lazerMod) : '';
+    let bitmap: ImageBitmap | undefined;
+    if (spec !== undefined && textures !== null && extended !== '') {
+      bitmap = composeModIcon(textures, spec, extended);
+    }
+    if (bitmap === undefined && spec?.stem !== undefined) {
+      bitmap = skin?.images.get(`selection-mod-${spec.stem}@2x.png`) ?? skin?.images.get(`selection-mod-${spec.stem}.png`);
+    }
+    if (bitmap === undefined && spec !== undefined && textures !== null) {
+      bitmap = composeModIcon(textures, spec);
+    }
+    return { acronym, bitmap };
   });
-  const totalW = widths.reduce((s, w) => s + w, 0) + MOD_ICON_GAP * (active.length - 1);
+}
+
+/**
+ * Draw the active-mod icon row under the accuracy readout (top-right), from a row resolved
+ * by `buildModIconRow`.
+ */
+export function drawModIcons(ctx: CanvasRenderingContext2D, row: readonly ModIconSlot[]): void {
+  if (row.length === 0) return;
+
+  const widths = row.map(({ bitmap }) =>
+    bitmap ? (bitmap.width / bitmap.height) * MOD_ICON_H : MOD_ICON_H * 1.6);
+  const totalW = widths.reduce((s, w) => s + w, 0) + MOD_ICON_GAP * (row.length - 1);
 
   let x = ACC_RIGHT_X - totalW;
-  for (let i = 0; i < active.length; i++) {
-    const { stem, label } = active[i]!;
+  for (let i = 0; i < row.length; i++) {
+    const { acronym, bitmap } = row[i]!;
     const w = widths[i]!;
-    const bmp = modImg(stem);
 
-    if (bmp) {
-      ctx.drawImage(bmp, x, MOD_Y, w, MOD_ICON_H);
+    if (bitmap) {
+      ctx.drawImage(bitmap, x, MOD_Y, w, MOD_ICON_H);
     } else {
       ctx.save();
       ctx.beginPath();
@@ -288,7 +290,7 @@ export function drawModIcons(
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillStyle = '#ffffff';
-      ctx.fillText(label, x + w / 2, MOD_Y + MOD_ICON_H / 2);
+      ctx.fillText(acronym, x + w / 2, MOD_Y + MOD_ICON_H / 2);
       ctx.restore();
     }
 

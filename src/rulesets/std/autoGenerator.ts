@@ -99,7 +99,7 @@ function moveToObject(
 // next move releases it). Returns the key-up time.
 function followSlider(
   frames: AutoFrame[], beatmap: BeatmapData, slider: Slider, bits: number, radius: number,
-  fy: (y: number) => number,
+  fx: (x: number) => number, fy: (y: number) => number,
 ): number {
   const path     = sampleSlider(slider);
   const slideDur = slideDurationMs(beatmap, slider);
@@ -108,10 +108,10 @@ function followSlider(
 
   for (let t = slider.time + FRAME_STEP; t < endTime; t += FRAME_STEP) {
     const p = sliderBallPos(path, t, slider.time, slideDur, slider.slides);
-    frames.push({ time: Math.trunc(t), x: p.x - shift, y: fy(p.y) - shift, keys: bits });
+    frames.push({ time: Math.trunc(t), x: fx(p.x) - shift, y: fy(p.y) - shift, keys: bits });
   }
   const pEnd = sliderBallPos(path, endTime, slider.time, slideDur, slider.slides);
-  frames.push({ time: endTime, x: pEnd.x - shift, y: fy(pEnd.y) - shift, keys: bits });
+  frames.push({ time: endTime, x: fx(pEnd.x) - shift, y: fy(pEnd.y) - shift, keys: bits });
   return endTime + KEY_UP_DELAY;
 }
 
@@ -148,11 +148,12 @@ export function generateStdAutoReplay(beatmap: BeatmapData, modDiff: ModDifficul
   if (objs.length === 0) return [];
 
   const radius = modDiff.circleRadiusPx;
-  // HR flips Y about the playfield centre at query time (hitJudge `fy`), never mutating raw
+  // HR / Mirror reflect the playfield at query time (hitJudge `fx`/`fy`), never mutating raw
   // positions; the generated cursor must land on the same flipped layout the judge compares
-  // (circle/slider-head: `fy(obj.y) - stackShift`; slider ball: `fy(raw.y) - stackShift`).
+  // (circle/slider-head: `fx(obj.x) - stackShift`, `fy(obj.y) - stackShift`; slider ball likewise).
   // Stacking is on original positions, so the shift is subtracted AFTER the flip, as in the judge.
-  const fy = modDiff.isHR ? (y: number) => 384 - y : (y: number) => y;
+  const fx = modDiff.flipX ? (x: number) => 512 - x : (x: number) => x;
+  const fy = modDiff.flipY ? (y: number) => 384 - y : (y: number) => y;
   const frames: AutoFrame[] = [];
 
   // First frame: cursor parked below the playfield, 1500 ms before the first note.
@@ -187,7 +188,7 @@ export function generateStdAutoReplay(beatmap: BeatmapData, modDiff: ModDifficul
     } else {
       const o = obj as HitCircle | Slider;
       const shift = o.stackHeight * radius / 10;
-      targetX = o.x - shift;
+      targetX = fx(o.x) - shift;
       targetY = fy(o.y) - shift;
     }
 
@@ -202,7 +203,7 @@ export function generateStdAutoReplay(beatmap: BeatmapData, modDiff: ModDifficul
     if (obj.type === 'circle') {
       releaseTime = startTime + KEY_UP_DELAY;
     } else if (obj.type === 'slider') {
-      releaseTime = followSlider(frames, beatmap, obj, bits, radius, fy);
+      releaseTime = followSlider(frames, beatmap, obj, bits, radius, fx, fy);
     } else {
       releaseTime = spinSpinner(frames, obj, bits, spinnerStartAngle);
     }

@@ -1,8 +1,9 @@
 import type { BeatmapData, HitResult, HitSample } from '../types/index.js';
 import type { ComboFrame } from '../renderer/HUDRenderer.js';
 import type { TaikoInputEvent } from '../rulesets/taiko/input.js';
-import { computeHitsoundSchedule, resolveSample, lookupSkinSound } from './hitsoundSchedule.js';
+import { computeHitsoundSchedule, resolveSample, lookupEffectSound, lookupStoryboardSample } from './hitsoundSchedule.js';
 import type { PendingSound } from './hitsoundSchedule.js';
+import type { StoryboardSample } from '../storyboard/types.js';
 // Pitch-preserved tempo stretch (WSOLA). DT/HT pre-stretch the decoded buffer once at
 // construction, then play it via a sample-accurate-seeking buffer source.
 import { timeStretch } from './TimeStretch.js';
@@ -15,10 +16,10 @@ import { timeStretch } from './TimeStretch.js';
  */
 export interface MixdownInputs {
   songBuffer: AudioBuffer | null;
-  // Active sound map (skin-only or beatmap-merged, per the "Beatmap Hitsounds" toggle).
+  // The user skin's sounds alone.
   skinSounds: ReadonlyMap<string, AudioBuffer>;
-  // False ⇒ ignore beatmap custom-file refs so they fall through to the skin's set/type sample.
-  beatmapHitsounds: boolean;
+  // The beatmap archive's own audio files, or null when the "Beatmap Hitsounds" toggle is off.
+  beatmapSounds: ReadonlyMap<string, AudioBuffer> | null;
   lazerDefaultSounds: ReadonlyMap<string, AudioBuffer> | null;
   beatmap: BeatmapData;
   hitResults: readonly HitResult[];
@@ -26,6 +27,10 @@ export interface MixdownInputs {
   maniaSamples: ReadonlyMap<number, HitSample> | null;
   taikoGhostTaps: readonly TaikoInputEvent[] | null;
   comboFrames: readonly ComboFrame[];
+  // The storyboard's `Sample` events, or null when it has none or the storyboard is off.
+  storyboardSamples: readonly StoryboardSample[] | null;
+  // The archive's audio files for those samples, whatever the "Beatmap Hitsounds" toggle says.
+  storyboardSounds: ReadonlyMap<string, AudioBuffer>;
   introOffsetMs: number;
   oldOffsetMs: number;
   speed: number;
@@ -59,12 +64,12 @@ const SAMPLE_CONCURRENCY = 2;
 export class AudioSync {
   private readonly ctx: AudioContext;
   private readonly songBuffer: AudioBuffer | null;
-  // Two sound maps for the "Beatmap Hitsounds" toggle: skin-only (skin assets before the
-  // beatmap merge) and merged (beatmap samples override skin, osu!'s default). `_activeSounds`
-  // picks one by `_beatmapHitsounds`. When OFF, customFile refs are also ignored at flush time
-  // so beatmap-named samples fall through to the skin's set/type sample (matches osu!).
+  // Two sound maps for the "Beatmap Hitsounds" toggle: the user skin's own sounds and the
+  // beatmap archive's audio files. `_activeBeatmapSounds` hands the resolver the beatmap map
+  // when ON (osu!'s default) and null when OFF, so beatmap-named / beatmap-shipped samples
+  // fall through to the skin's set/type sample (matches osu!).
   private readonly _skinOnlySounds: Map<string, AudioBuffer>;
-  private readonly _mergedSounds: Map<string, AudioBuffer>;
+  private readonly _beatmapSounds: Map<string, AudioBuffer>;
   private _beatmapHitsounds: boolean;
   private readonly hitResults: readonly HitResult[];
   private readonly beatmap: BeatmapData;
@@ -89,6 +94,11 @@ export class AudioSync {
   // below skin lookups and above synth. Only these defaults fill gaps — a skin's own
   // files are never substituted from elsewhere.
   private readonly lazerDefaultSounds: ReadonlyMap<string, AudioBuffer> | null;
+  // Storyboard `Sample` events (see `playableStoryboardSamples`); they follow the storyboard
+  // toggle (`_storyboardOn`), not "Beatmap Hitsounds", and resolve straight from the
+  // archive's files (then the skin's) with no synth proxy and no concurrency cap.
+  private readonly _storyboardSamples: readonly StoryboardSample[] | null;
+  private _storyboardOn: boolean;
   // NC vs DT/HT: NC pitch-shifts the raw buffer (playbackRate = speed); DT/HT preserve pitch by
   // playing a pre-stretched buffer (SoundTouch WSOLA) at rate 1 — same as the offline mixdown.
   private readonly _isNC: boolean;
@@ -133,10 +143,10 @@ export class AudioSync {
   constructor(options: {
     ctx: AudioContext;
     songBuffer: AudioBuffer | null;
-    // Skin-only sound map (skin assets before the beatmap merge).
+    // The user skin's sounds alone.
     skinSounds: Map<string, AudioBuffer>;
-    // Merged map: beatmap samples override skin per stem (osu!'s "Beatmap Hitsounds = ON").
-    mergedSounds: Map<string, AudioBuffer>;
+    // The beatmap archive's own audio files (custom-named samples, `{set}-hit{type}{N}` overrides).
+    beatmapSounds: Map<string, AudioBuffer>;
     // Initial toggle state; default ON (= current behaviour, beatmap samples win).
     beatmapHitsounds?: boolean;
     hitResults: readonly HitResult[];
@@ -150,11 +160,15 @@ export class AudioSync {
     taikoGhostTaps?: readonly TaikoInputEvent[] | null;
     comboFrames?: readonly ComboFrame[];
     lazerDefaultSounds?: ReadonlyMap<string, AudioBuffer> | null;
+    // The storyboard's playable `Sample` events (`playableStoryboardSamples`); default none.
+    storyboardSamples?: readonly StoryboardSample[] | null;
+    // Initial storyboard-samples toggle state; default ON (mirror `RenderOptions.showStoryboard`).
+    storyboardOn?: boolean;
   }) {
     this.ctx          = options.ctx;
     this.songBuffer   = options.songBuffer;
     this._skinOnlySounds = options.skinSounds;
-    this._mergedSounds   = options.mergedSounds;
+    this._beatmapSounds  = options.beatmapSounds;
     this._beatmapHitsounds = options.beatmapHitsounds ?? true;
     this.hitResults   = options.hitResults;
     this.beatmap      = options.beatmap;
@@ -166,6 +180,8 @@ export class AudioSync {
     this.taikoGhostTaps = options.taikoGhostTaps ?? null;
     this.comboFrames  = options.comboFrames ?? [];
     this.lazerDefaultSounds = options.lazerDefaultSounds ?? null;
+    this._storyboardSamples = options.storyboardSamples?.length ? options.storyboardSamples : null;
+    this._storyboardOn = options.storyboardOn ?? true;
 
     this.songGain    = options.ctx.createGain();
     this.effectsGain = options.ctx.createGain();
@@ -205,9 +221,9 @@ export class AudioSync {
     this.effectsGain.gain.value = Math.max(0, Math.min(1, v));
   }
 
-  /** Sound map the resolver consults: merged (beatmap wins) when ON, skin-only when OFF. */
-  private get _activeSounds(): Map<string, AudioBuffer> {
-    return this._beatmapHitsounds ? this._mergedSounds : this._skinOnlySounds;
+  /** Beatmap sounds the resolver may consult: the archive's files when ON, null when OFF. */
+  private get _activeBeatmapSounds(): Map<string, AudioBuffer> | null {
+    return this._beatmapHitsounds ? this._beatmapSounds : null;
   }
 
   /**
@@ -220,6 +236,28 @@ export class AudioSync {
   setBeatmapHitsounds(on: boolean): void {
     if (on === this._beatmapHitsounds) return;
     this._beatmapHitsounds = on;
+    this._rescheduleIfPlaying();
+  }
+
+  /**
+   * Toggle storyboard samples live — the audio half of `RenderOptions.showStoryboard`; hosts
+   * set both. Off drops them from the schedule (and from `getMixdownInputs`); a running sample
+   * stops at once, as lazer stops long storyboard samples when playback is disabled.
+   */
+  setStoryboardSamples(on: boolean): void {
+    if (on === this._storyboardOn) return;
+    this._storyboardOn = on;
+    this._rescheduleIfPlaying();
+  }
+
+  /** Storyboard samples the schedule should carry right now (null when off or none). */
+  private get _activeStoryboardSamples(): readonly StoryboardSample[] | null {
+    return this._storyboardOn ? this._storyboardSamples : null;
+  }
+
+  // Hitsound-only reschedule from the current position (song clock untouched), so a toggle is
+  // audible on the next hit instead of after the ~2s look-ahead window rolls over.
+  private _rescheduleIfPlaying(): void {
     if (!this._isPlaying) return;
     for (const src of this.activeHitsounds) {
       try { src.stop(); } catch (_) { /* already ended */ }
@@ -239,8 +277,8 @@ export class AudioSync {
   getMixdownInputs(): MixdownInputs {
     return {
       songBuffer: this.songBuffer,
-      skinSounds: this._activeSounds,
-      beatmapHitsounds: this._beatmapHitsounds,
+      skinSounds: this._skinOnlySounds,
+      beatmapSounds: this._activeBeatmapSounds,
       lazerDefaultSounds: this.lazerDefaultSounds,
       beatmap: this.beatmap,
       hitResults: this.hitResults,
@@ -248,6 +286,8 @@ export class AudioSync {
       maniaSamples: this.maniaSamples,
       taikoGhostTaps: this.taikoGhostTaps,
       comboFrames: this.comboFrames,
+      storyboardSamples: this._activeStoryboardSamples,
+      storyboardSounds: this._beatmapSounds,
       introOffsetMs: this.introOffsetMs,
       oldOffsetMs: this.oldOffsetMs,
       speed: this.speed,
@@ -374,6 +414,7 @@ export class AudioSync {
       comboFrames: this.comboFrames,
       oldOffsetMs: this.oldOffsetMs,
       fromBeatmapMs,
+      storyboardSamples: this._activeStoryboardSamples,
     });
     this._pendingSoundIdx = 0;
     this._sampleVoices = null;
@@ -407,11 +448,10 @@ export class AudioSync {
         this._scheduleCombobreak(clampedWhen);
       } else if (ev.type === 'spinnerbonus') {
         this._scheduleSpinnerBonus(clampedWhen, ev.volume ?? 1);
+      } else if (ev.type === 'storyboard') {
+        this._scheduleStoryboardSample(ev.customFile, clampedWhen, ev.volume ?? 1);
       } else {
-        // OFF ignores the beatmap's custom file ref so resolution falls through to the
-        // skin's set/type sample (osu!-faithful) instead of synth.
-        const customFile = this._beatmapHitsounds ? ev.customFile : '';
-        this._scheduleResolvedSound(ev.type, ev.sampleSet, ev.sampleIndex, customFile, clampedWhen, ev.volume ?? 1);
+        this._scheduleResolvedSound(ev.type, ev.sampleSet, ev.sampleIndex, ev.customFile, clampedWhen, ev.volume ?? 1);
       }
     }
     if (this._flushTimer !== null) {
@@ -421,7 +461,7 @@ export class AudioSync {
   }
 
   private _scheduleCombobreak(when: number): void {
-    const buf = lookupSkinSound(this._activeSounds, 'combobreak');
+    const buf = lookupEffectSound(this._skinOnlySounds, this._activeBeatmapSounds, 'combobreak');
     if (buf === null) return;
     const src = this.ctx.createBufferSource();
     src.buffer = buf;
@@ -433,7 +473,26 @@ export class AudioSync {
   // Spinner bonus sample (one per bonus spin). Silent if the skin ships no spinnerbonus
   // file — same policy as combobreak (no default exists for it), no synth proxy.
   private _scheduleSpinnerBonus(when: number, volume: number): void {
-    const buf = lookupSkinSound(this._activeSounds, 'spinnerbonus');
+    const buf = lookupEffectSound(this._skinOnlySounds, this._activeBeatmapSounds, 'spinnerbonus');
+    if (buf === null) return;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    if (volume !== 1) {
+      const gain = this.ctx.createGain();
+      gain.gain.value = volume;
+      src.connect(gain);
+      gain.connect(this.effectsGain);
+    } else {
+      src.connect(this.effectsGain);
+    }
+    src.start(when);
+    this.activeHitsounds.push(src);
+  }
+
+  // Storyboard sample: silent if the archive and skin lack the file (no synth proxy); never
+  // concurrency-capped (each `Sample` line is its own voice in osu!).
+  private _scheduleStoryboardSample(path: string, when: number, volume: number): void {
+    const buf = lookupStoryboardSample(this._beatmapSounds, this._skinOnlySounds, path);
     if (buf === null) return;
     const src = this.ctx.createBufferSource();
     src.buffer = buf;
@@ -459,7 +518,8 @@ export class AudioSync {
   ): void {
     const buf = resolveSample(type, sampleSet, sampleIndex, customFile, {
       mode: this.mode,
-      skinSounds: this._activeSounds,
+      skinSounds: this._skinOnlySounds,
+      beatmapSounds: this._activeBeatmapSounds,
       lazerDefaultSounds: this.lazerDefaultSounds,
       synthCache: this.synthCache,
       ctx: this.ctx,

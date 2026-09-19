@@ -112,6 +112,9 @@ export const stdRuleset: Ruleset<StdSession> = {
     drawHitObjects(ctx, s.beatmap, s.skin, timeMs, s.hitResults, s.spinnerAngles, md, s.qualityTotal);
     drawJudgements(ctx, s.hitResults, timeMs, s.skin, 'std', md.circleRadiusPx);
     if (options.modFlashlight) stdFlashlight(s).draw(ctx, timeMs);
+  },
+
+  drawAboveStoryboard(ctx: CanvasRenderingContext2D, s: StdSession, timeMs: number, options: RenderOptions): void {
     drawCursor(ctx, s.replay, timeMs, s.skin);
     if (options.showKeyOverlay) drawKeyOverlay(ctx, s.replay, timeMs, s.skin);
   },

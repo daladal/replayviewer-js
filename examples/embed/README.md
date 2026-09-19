@@ -1,11 +1,14 @@
 # Embed example — iframe + postMessage, no library required
 
 Instead of importing the JS library and building your own render/playback pipeline, 
-this frames the **hosted viewer** (replayviewer.com) in an iframe at `?embed=1` and 
-feeds it a replay over `postMessage`. 
-
+this frames replayviewer.com in an iframe at `?embed=1` and feeds it a replay over `postMessage`.
+ 
 There is no library import and nothing to build — the entire
 engine runs inside the iframe; this page only supplies replay/beatmap bytes.
+
+If you don't need to supply your own replay/beatmap you can simply add `?embed=1` to a replayviewer URL 
+to frame the sites player and settings panel:
+`https://www.replayviewer.com/?embed=1#score=1624832558&skin=YUGEN`
 
 ## Run it
 

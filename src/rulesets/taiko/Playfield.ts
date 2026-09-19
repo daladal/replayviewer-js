@@ -228,6 +228,9 @@ function taikoHiddenAlpha(hitTime: number, timeMs: number, scrollVel: number): n
 /**
  * Bar-line times (ms): one line per measure (meter × beatLength) from each
  * uninherited timing point until the next, extending 5 s past the last object.
+ * Times within 1e-3 ms of a whole millisecond are snapped to it (as osu! does):
+ * accumulated float error would otherwise leave a bar a hair *before* a green
+ * line placed on that downbeat, giving the line the pre-change scroll velocity.
  * Pre-computed once per session; render walks a binary-searched slice.
  */
 export function computeBarLineTimes(beatmap: BeatmapData): number[] {
@@ -249,6 +252,8 @@ export function computeBarLineTimes(beatmap: BeatmapData): number[] {
     const nextStart = i + 1 < uninherited.length ? uninherited[i + 1]!.time : endTime;
     const step = Math.max(1, tp.meter * tp.beatLength);
     for (let t = tp.time; t < nextStart; t += step) {
+      const rounded = Math.round(t);
+      if (Math.abs(t - rounded) < 1e-3) t = rounded;
       lines.push(t);
       if (lines.length >= MAX_LINES) return lines;
     }
@@ -1649,6 +1654,7 @@ export function drawTaikoPlayfield(
   ctx.rect(LANE_LEFT_X, 0, LANE_RIGHT_X - LANE_LEFT_X, LOGICAL_H);
   ctx.clip();
 
+  // Bar lines sit behind the notes (an opaque note fully hides a bar line it overlaps).
   drawBarLines(ctx, session.barLines, barLineVel, timeMs, maxScrollMs, lookback, skin);
 
   const { firstIdx, lastIdx } = findObjectVisibleRange(session.objects, timeMs, maxScrollMs, lookback);
@@ -1665,17 +1671,19 @@ export function drawTaikoPlayfield(
 
   ctx.restore();
 
-  // Flying-hit arc renders outside lane clip so the parabola isn't masked (lazer's ProxyContent).
-  drawFlyingHits(
-    ctx, session.objects, objectVel, firstIdx, lastIdx, timeMs, skin,
-    session.hitJudgmentByNote, session.beatmap, comboNow,
-  );
+  if (options.taikoFlyingHits) {
+    // Flying-hit arc renders outside lane clip so the parabola isn't masked (lazer's ProxyContent).
+    drawFlyingHits(
+      ctx, session.objects, objectVel, firstIdx, lastIdx, timeMs, skin,
+      session.hitJudgmentByNote, session.beatmap, comboNow,
+    );
 
-  // Drum-roll tick hits fly off too (same layer); shown even in HD since the roll stays visible.
-  drawDrumRollFlyingHits(
-    ctx, session.objects, objectVel, firstIdx, lastIdx, timeMs, skin,
-    session.hitResults, session.beatmap, comboNow,
-  );
+    // Drum-roll tick hits fly off too (same layer); shown even in HD since the roll stays visible.
+    drawDrumRollFlyingHits(
+      ctx, session.objects, objectVel, firstIdx, lastIdx, timeMs, skin,
+      session.hitResults, session.beatmap, comboNow,
+    );
+  }
 
   drawInputDrum(ctx, session.inputEvents, timeMs, skin);
 

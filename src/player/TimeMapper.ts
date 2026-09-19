@@ -5,7 +5,8 @@ import type { ReplayFrame } from '../types/index';
  * intro/outro trim and mod speed. All values are ms. `mapDurationMs` is the summed frame
  * deltas (beatmap time); `presentationDurationMs` is the trimmed duration divided by
  * `speed`, floored at 1000ms. Trim offsets derive from beatmap note times (not frame
- * deltas) so `presentationDurationMs` is always positive.
+ * deltas) so `presentationDurationMs` is always positive. A negative intro offset starts
+ * presentation before map time 0 (a storyboard intro), lengthening the timeline instead.
  */
 export class TimeMapper {
   readonly introOffsetMs: number;
@@ -24,7 +25,7 @@ export class TimeMapper {
     this.speed = speed;
 
     const maxTrim = Math.max(0, cumTime - 1000);
-    this.introOffsetMs  = Math.max(0, Math.min(introOffsetMs, maxTrim));
+    this.introOffsetMs  = Math.min(introOffsetMs, maxTrim);
     this.outroOffsetMs  = Math.max(0, Math.min(outroOffsetMs, maxTrim - this.introOffsetMs));
     this.presentationDurationMs = Math.max(1000,
       (cumTime - this.introOffsetMs - this.outroOffsetMs) / speed);

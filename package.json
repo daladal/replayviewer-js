@@ -1,6 +1,6 @@
 {
   "name": "replayviewer-js",
-  "version": "0.1.1",
+  "version": "1.0.0",
   "description": "Render osu! replays in the browser — parsers, judgement engine, and canvas renderer for all four rulesets",
   "license": "MIT",
   "repository": {

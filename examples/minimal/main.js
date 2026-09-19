@@ -42,8 +42,13 @@ async function buildSession() {
     replay,
     beatmapSet: oszBytes,
     skin: buildSkin(skin, undefined, { mode: replay.mode }),
-    // Optional: the 12 default fallback hitsounds (most taiko skins depend on these). 
+    // Optional: the 12 default fallback hitsounds (most taiko skins depend on these)
+    // and the lazer-style mod-icon textures.
     lazerDefaultsUrl: '../../assets/lazer-defaults',
+    // Optional: parse + draw the beatmap's storyboard, and play its video (needs a DOM).
+    // Both default to off. The bundled sample map has neither, so nothing extra is drawn here.
+    storyboard: true,
+    video: true,
   });
 
   // `session.renderer.options` is a plain mutable object — flip any of these at
@@ -54,6 +59,8 @@ async function buildSession() {
     showFollowpoints: true, // stream lines between consecutive hit objects
     showURBar:        true, // unstable-rate bar
     showModIcons:     true, // mod icons (HD/HR/DT/...)
+    showStoryboard:   true, // storyboard sprites (when loaded with `storyboard: true`)
+    showVideo:        true, // beatmap video (when loaded with `video: true`)
   });
 
   // `session.audioSync` exposes the live audio knobs; each takes effect immediately.

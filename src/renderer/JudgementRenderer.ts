@@ -1,11 +1,7 @@
 import type { HitResult, SkinAssets } from '../types/index';
+import { SCALE, OFFSET_X, OFFSET_Y } from './playfield';
 
-const CANVAS_W = 1280;
-const CANVAS_H = 720;
 // Must match HitObjectRenderer.
-const SCALE    = Math.min(800 / 512, 600 / 384) * 0.9;
-const OFFSET_X = (CANVAS_W - 512 * SCALE) / 2;
-const OFFSET_Y = (CANVAS_H - 384 * SCALE) / 2;
 
 function toCanvas(x: number, y: number): [number, number] {
   return [OFFSET_X + x * SCALE, OFFSET_Y + y * SCALE];

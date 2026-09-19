@@ -72,7 +72,10 @@ export const catchRuleset: Ruleset<CatchSession> = {
   draw(ctx: CanvasRenderingContext2D, s: CatchSession, timeMs: number, options: RenderOptions): void {
     // Falling fruit/droplets/bananas + replay-driven catcher.
     drawCatchPlayfield(ctx, s, timeMs, options);
-    // Key overlay (Left/Right/Dash), drawn on top of the playfield.
+  },
+
+  // Key overlay (Left/Right/Dash): HUD in osu!, so above the storyboard's Overlay layer.
+  drawAboveStoryboard(ctx: CanvasRenderingContext2D, s: CatchSession, timeMs: number, options: RenderOptions): void {
     if (options.showKeyOverlay) drawCatchKeyOverlay(ctx, s.catcherPath, timeMs, s.skin);
   },
 

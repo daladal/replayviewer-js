@@ -66,7 +66,7 @@ const ALLOW = [
   /^taiko-barline(@2x)?\.png$/,
   /^taiko-glow(@2x)?\.png$/,
   // mod icons
-  /^selection-mod-(nofail|easy|hidden|hardrock|suddendeath|doubletime|relax|halftime|nightcore|flashlight|spunout)(@2x)?\.png$/,
+  /^selection-mod-(nofail|easy|hidden|hardrock|suddendeath|perfect|doubletime|relax|halftime|nightcore|flashlight|spunout|fadein|mirror)(@2x)?\.png$/,
   // samples
   /^combobreak\.(wav|mp3|ogg)$/,
   /^spinnerbonus\.(wav|mp3|ogg)$/,

@@ -1,3 +1,4 @@
+import { MOD_ICON_SPECS, type LazerModIconTextures } from '../utils/modIcons.js';
 import type { SkinAssets, SkinConfig, ManiaSkinSection } from '../types/index.js';
 import { unzipAsync } from './BeatmapSetLoader.js';
 
@@ -218,7 +219,12 @@ function parseSkinIni(text: string): SkinConfig {
 // in-flight work keeps near-peak throughput without that failure window.
 const DECODE_CONCURRENCY = 12;
 
-async function runPooled(tasks: ReadonlyArray<() => Promise<void>>): Promise<void> {
+/**
+ * Run async tasks through a bounded pool. Browser image/audio decoders are themselves a small
+ * internal pool, so firing hundreds at once only spikes GPU/RAM (and intermittently rejects in
+ * Firefox); shared by the skin and storyboard decoders.
+ */
+export async function runPooled(tasks: ReadonlyArray<() => Promise<void>>): Promise<void> {
   let next = 0;
   const runner = async (): Promise<void> => {
     while (next < tasks.length) {
@@ -429,6 +435,48 @@ export async function loadLazerDefaultSounds(
     return out;
   })();
   return _lazerDefaultLoadInFlight;
+}
+
+// osu!'s default mod-icon textures (see `LazerModIconTextures`), served by the host app under
+// `${baseUrl}/mods/`: `mod-icon.png`, `mod-icon-extender.png`, and the `mod-<name>.png` glyphs
+// named in `MOD_ICON_SPECS`. Missing glyphs just leave those mods on the text fallback.
+let _lazerDefaultModIcons: LazerModIconTextures | null = null;
+let _lazerDefaultModIconLoadInFlight: Promise<LazerModIconTextures | null> | null = null;
+
+/**
+ * Loads (once — memoized module-wide, so the first call's `baseUrl` wins) osu!'s default
+ * mod-icon textures from `${baseUrl}/mods/`. Returns null when the badge is missing;
+ * otherwise the glyph map may be partial (fetch/decode failures are skipped). The HUD
+ * composes them per session (`composeModIcon`) for mods the skin has no sprite for and for
+ * mods carrying extended info such as a custom rate.
+ */
+export async function loadLazerDefaultModIcons(
+  baseUrl: string = 'skins/lazer-defaults',
+): Promise<LazerModIconTextures | null> {
+  if (_lazerDefaultModIcons !== null) return _lazerDefaultModIcons;
+  if (_lazerDefaultModIconLoadInFlight !== null) return _lazerDefaultModIconLoadInFlight;
+  _lazerDefaultModIconLoadInFlight = (async () => {
+    const fetchBitmap = async (name: string): Promise<ImageBitmap | null> => {
+      try {
+        const resp = await fetch(`${baseUrl}/mods/${name}.png`);
+        if (!resp.ok) return null;
+        return await createImageBitmap(await resp.blob());
+      } catch {
+        return null;
+      }
+    };
+    const [badge, extender] = await Promise.all([fetchBitmap('mod-icon'), fetchBitmap('mod-icon-extender')]);
+    if (badge === null) return null;
+    const glyphs = new Map<string, ImageBitmap>();
+    await Promise.all(MOD_ICON_SPECS.map(async spec => {
+      if (spec.glyph === undefined) return;
+      const glyph = await fetchBitmap(spec.glyph);
+      if (glyph !== null) glyphs.set(spec.acronym, glyph);
+    }));
+    _lazerDefaultModIcons = { badge, extender, glyphs };
+    return _lazerDefaultModIcons;
+  })();
+  return _lazerDefaultModIconLoadInFlight;
 }
 
 /**

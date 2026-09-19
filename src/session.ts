@@ -4,7 +4,7 @@
 
 import { parseReplay } from './parsers/ReplayParser.js';
 import { parseBeatmap } from './parsers/BeatmapParser.js';
-import { mergeSkinAssets, mergeSounds, loadLazerDefaultSounds } from './parsers/SkinLoader.js';
+import { mergeSkinAssets, loadLazerDefaultSounds, loadLazerDefaultModIcons } from './parsers/SkinLoader.js';
 import { loadBeatmapSet } from './parsers/BeatmapSetLoader.js';
 import { applyStacking } from './utils/stacking.js';
 import { computeModDifficulty, type ModDifficulty } from './utils/modDifficulty.js';
@@ -16,6 +16,12 @@ import { Renderer } from './renderer/Renderer.js';
 import { warmSkinCaches, isBlankImage } from './renderer/HitObjectRenderer.js';
 import { warmSliderPaths } from './renderer/SliderGeometry.js';
 import type { BeatmapData, ReplayData, SkinAssets } from './types/index.js';
+import type { StoryboardData } from './storyboard/types.js';
+import type { StoryboardImage } from './storyboard/StoryboardAssets.js';
+import type { StoryboardRenderInputs } from './storyboard/StoryboardRenderer.js';
+import { playableStoryboardSamples } from './storyboard/StoryboardCompiler.js';
+import type { VideoFrameSource } from './storyboard/VideoFrameSource.js';
+import { createVideoElementSource, probeVideoSupport, type VideoStatus } from './storyboard/videoElementSource.js';
 
 /**
  * Decoded beatmap-set assets, reusable across sessions built from the same .osr
@@ -30,6 +36,12 @@ export interface BeatmapAssets {
   readonly songBuffer: AudioBuffer | null;
   readonly background: ImageBitmap | null;
   readonly beatmapSounds: Map<string, AudioBuffer>;
+  /** Parsed storyboard, or null when not loaded (see `LoadBeatmapSetOptions.storyboard`). */
+  readonly storyboard: StoryboardData | null;
+  /** Decoded storyboard images keyed by resolved archive path; empty when not loaded. */
+  readonly storyboardImages: Map<string, StoryboardImage>;
+  /** Beatmap video bytes, or null when not loaded (see `LoadBeatmapSetOptions.video`). */
+  readonly video: { path: string; bytes: Uint8Array } | null;
 }
 
 export interface ReplaySessionInputs {
@@ -48,9 +60,10 @@ export interface ReplaySessionInputs {
   /** User playback-rate multiplier on top of the mod speed. Default 1. */
   userRate?: number;
   /**
-   * Base URL of the 12 default hitsound wavs (see `loadLazerDefaultSounds`). Default
-   * `'skins/lazer-defaults'` relative to the page; a missing directory just weakens the
-   * hitsound fallback cascade (synthesized sounds back it up).
+   * Base URL of osu!'s default assets: the 12 hitsound wavs (see `loadLazerDefaultSounds`)
+   * and, under `mods/`, the default mod-icon textures (see `loadLazerDefaultModIcons`).
+   * Default `'skins/lazer-defaults'` relative to the page; a missing directory just weakens
+   * the fallbacks (synthesized hitsounds, text-label mod icons).
    */
   lazerDefaultsUrl?: string;
   /**
@@ -58,6 +71,20 @@ export interface ReplaySessionInputs {
    * in the 'auto' backing-store quality decision. Default 1 (canvas shown at CSS size).
    */
   pageZoom?: number;
+  /**
+   * Load the beatmap's storyboard from an `.osz` `beatmapSet` (parse + decode its images) and
+   * draw it. Default false for a fresh archive; pre-loaded `BeatmapAssets` that carry a
+   * storyboard draw it unless this is explicitly false. `RenderOptions.showStoryboard` toggles it live.
+   */
+  storyboard?: boolean;
+  /**
+   * Also play the beatmap video (the storyboard's `Video` event) through a `<video>` element,
+   * which needs a DOM. Takes effect only with `storyboard`: a fresh `.osz` is then read with
+   * its video bytes, pre-loaded `BeatmapAssets` play the bytes they carry unless this is
+   * explicitly false. `RenderOptions.showVideo` toggles it live; `CoreSession.videoStatus`
+   * says why nothing plays.
+   */
+  video?: boolean;
 }
 
 export interface CoreSession {
@@ -75,13 +102,33 @@ export interface CoreSession {
   readonly background: ImageBitmap | null;
   /** Decoded set assets for reuse via `beatmapSet` on a later build. Ownership stays with the caller. */
   readonly assets: BeatmapAssets;
-  /** Stops the RAF loop and releases audio nodes. Does not close `assets` bitmaps/buffers. */
+  /** Whether the beatmap video can play, and if not why (`'none'` when the storyboard has no video). */
+  readonly videoStatus: VideoStatus;
+  /** The video decoder behind the renderer, or null; `failed` flips if the browser cannot decode the file. */
+  readonly video: VideoFrameSource | null;
+  /** Stops the RAF loop, releases audio nodes and the video decoder. Does not close `assets` bitmaps/buffers. */
   destroy(): void;
 }
 
-// Silent-intro trim: start playback 2 s before the first object's approach begins,
-// but only when that skips at least 4 s (short intros play in full).
-function computeIntroOffsetMs(beatmap: BeatmapData, preempt: number): number {
+// Storyboard images are decoded no larger than they can appear on screen; mirror the renderer's
+// 'auto' backing-store quality (device pixels per logical canvas px, capped like the renderer).
+function storyboardDecodeQuality(pageZoom: number): number {
+  const dpr = (typeof devicePixelRatio === 'number' ? devicePixelRatio : 1) || 1;
+  return Math.max(1, Math.min(dpr * pageZoom, 3));
+}
+
+/**
+ * Silent-intro trim: start playback 2 s before the first object's approach begins, but only
+ * when that skips at least 4 s (short intros play in full). A storyboard whose earliest event
+ * (`storyboardStartMs`) precedes that start pulls the start back to it, as osu! plays
+ * storyboard intros — possibly before map time 0, which the `TimeMapper` allows.
+ */
+export function computeIntroOffsetMs(beatmap: BeatmapData, preempt: number, storyboardStartMs: number | null = null): number {
+  const start = trimmedIntroStartMs(beatmap, preempt);
+  return storyboardStartMs === null ? start : Math.min(start, storyboardStartMs);
+}
+
+function trimmedIntroStartMs(beatmap: BeatmapData, preempt: number): number {
   const firstObjMs = beatmap.hitObjects[0]?.time;
   const firstHoldMs = beatmap.maniaHolds[0]?.time;
   let firstMs: number | undefined;
@@ -216,13 +263,17 @@ export async function createReplaySession(inputs: ReplaySessionInputs): Promise<
   let assets: BeatmapAssets;
   const fresh = inputs.beatmapSet instanceof ArrayBuffer;
   if (inputs.beatmapSet instanceof ArrayBuffer) {
-    const { osuBytes, audioBuffer: songBuffer, background, beatmapSounds } =
-      await loadBeatmapSet(inputs.beatmapSet, replayData.beatmapHash, audioContext, inputs.fetchOsuOverride);
+    const { osuBytes, audioBuffer: songBuffer, background, beatmapSounds, storyboard, storyboardImages, video } =
+      await loadBeatmapSet(inputs.beatmapSet, replayData.beatmapHash, audioContext, inputs.fetchOsuOverride, {
+        storyboard: inputs.storyboard === true,
+        video: inputs.storyboard === true && inputs.video === true,
+        storyboardDecodeQuality: storyboardDecodeQuality(inputs.pageZoom ?? 1),
+      });
     const beatmap = parseBeatmap(new TextDecoder('utf-8').decode(osuBytes));
     // Stash the raw .osu on the beatmap: consumers that re-parse it themselves (e.g.
     // difficulty/pp calculators) read it from here, and it survives asset-reuse rebuilds.
     beatmap.rawOsu = osuBytes;
-    assets = { beatmap, songBuffer, background, beatmapSounds };
+    assets = { beatmap, songBuffer, background, beatmapSounds, storyboard, storyboardImages, video };
   } else {
     assets = inputs.beatmapSet;
   }
@@ -270,15 +321,11 @@ export async function createReplaySession(inputs: ReplaySessionInputs): Promise<
 
   warmSliderPaths(beatmapData);
 
-  // Two sound maps for the "Beatmap Hitsounds" toggle. skin-only = skin assets alone;
-  // merged = beatmap-shipped samples override skin per stem (lazer/stable default with
-  // "Use beatmap hitsounds" = ON). Stem-aware so a beatmap `soft-hitnormal.ogg` displaces
-  // a skin `soft-hitnormal.wav` (which the .wav-first lookup would otherwise win); overlay
-  // = beatmap. AudioSync holds both and swaps live; skinAssets.sounds keeps the merged map
-  // (the toggle's default-ON state).
-  const skinOnlySounds = inputs.skin.sounds;
-  const mergedSounds = mergeSounds(skinOnlySounds, beatmapSounds);
-  const skinAssets: SkinAssets = { ...inputs.skin, sounds: mergedSounds };
+  // The skin's sounds and the beatmap archive's audio files stay separate: the sample
+  // resolver applies osu!'s beatmap-skin rules (custom index ≥ 1 gates beatmap files, custom
+  // filenames resolve only there) and the "Beatmap Hitsounds" toggle just withholds the
+  // beatmap map. AudioSync holds both.
+  const skinAssets: SkinAssets = inputs.skin;
 
   // Pre-populate hitCircleRatio/isBlankImage caches to avoid first-frame GPU→CPU readback stall.
   warmSkinCaches(skinAssets);
@@ -288,25 +335,36 @@ export async function createReplaySession(inputs: ReplaySessionInputs): Promise<
     if (frame.timeDelta >= 0) rawMapDurationMs += frame.timeDelta;
   }
 
-  const introOffsetMs = computeIntroOffsetMs(beatmapData, modDiff.preemptMs);
+  const videoStatus = probeVideoSupport(assets.storyboard, assets.video);
+  const video = inputs.storyboard !== false && inputs.video !== false && videoStatus.kind === 'playable'
+    ? createVideoElementSource(assets.video!)
+    : null;
+  const storyboardInputs: StoryboardRenderInputs | null = inputs.storyboard !== false && assets.storyboard !== null
+    ? { data: assets.storyboard, images: assets.storyboardImages, video: video === null ? null : { path: assets.video!.path, source: video } }
+    : null;
+  const introOffsetMs = computeIntroOffsetMs(beatmapData, modDiff.preemptMs, storyboardInputs?.data.earliestEventTime ?? null);
   const outroOffsetMs = computeOutroOffsetMs(beatmapData, rawMapDurationMs);
   const timeMapper    = new TimeMapper(replayData.frames, introOffsetMs, outroOffsetMs, modDiff.speed);
 
   const player = new Player(timeMapper.presentationDurationMs);
 
+  const [lazerDefaultSounds, lazerModIcons] = await Promise.all([
+    loadLazerDefaultSounds(audioContext, inputs.lazerDefaultsUrl),
+    loadLazerDefaultModIcons(inputs.lazerDefaultsUrl),
+  ]);
+
   const renderer = new Renderer(
     canvas, player, replayData, beatmapData, skinAssets, timeMapper, background, modDiff,
-    undefined, inputs.pageZoom ?? 1,
+    undefined, inputs.pageZoom ?? 1, lazerModIcons, storyboardInputs,
   );
-
-  const lazerDefaultSounds = await loadLazerDefaultSounds(audioContext, inputs.lazerDefaultsUrl);
+  renderer.options.userRate = inputs.userRate ?? 1;
 
   const mode = (replayData.mode === 1 ? 1 : replayData.mode === 3 ? 3 : replayData.mode === 2 ? 2 : 0) as 0 | 1 | 2 | 3;
   const audioSync = new AudioSync({
     ctx:          audioContext,
     songBuffer,
-    skinSounds:   skinOnlySounds,
-    mergedSounds,
+    skinSounds:   inputs.skin.sounds,
+    beatmapSounds,
     beatmapHitsounds: inputs.beatmapHitsounds ?? true,
     hitResults:   renderer.hitResults,
     beatmap:      beatmapData,
@@ -319,6 +377,7 @@ export async function createReplaySession(inputs: ReplaySessionInputs): Promise<
     taikoGhostTaps: renderer.taikoGhostTaps,
     comboFrames:  renderer.comboFrames,
     lazerDefaultSounds,
+    storyboardSamples: storyboardInputs === null ? null : playableStoryboardSamples(storyboardInputs.data),
   });
 
   return {
@@ -334,9 +393,12 @@ export async function createReplaySession(inputs: ReplaySessionInputs): Promise<
     speed: modDiff.speed,
     background,
     assets,
+    videoStatus,
+    video,
     destroy(): void {
-      renderer.stop();
+      renderer.destroy();
       audioSync.destroy();
+      video?.dispose();
     },
   };
 }

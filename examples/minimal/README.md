@@ -1,11 +1,5 @@
 # Minimal example — consume the library from `dist/` alone
 
-A plain HTML page + ES module that renders a replay using only the built library
-bundle. No bundler, no framework: `main.js` imports exclusively from
-`../../dist/index.js`.
-
-## Run it
-
 1. Build the library (from the repo root):
 
    ```sh
@@ -27,8 +21,10 @@ bundle. No bundler, no framework: `main.js` imports exclusively from
      ```
 
    - `../../assets/lazer-defaults/` — osu!'s 12 default fallback hitsound
-     `.wav`s (`normal-hitnormal.wav`, `soft-hitclap.wav`, …), also shipped
-     with the repo. If absent, synthesized fallback sounds are used instead.
+     `.wav`s (`normal-hitnormal.wav`, `soft-hitclap.wav`, …) and, under
+     `mods/`, the default mod-icon textures, also shipped with the repo. If
+     absent, synthesized fallback sounds and text-label mod icons are used
+     instead.
 
 3. Serve the **repo root** (the page reaches up to `dist/` and `assets/`):
 
@@ -49,10 +45,13 @@ bundle. No bundler, no framework: `main.js` imports exclusively from
   stretching (`dist/stretch-worker.js`). Optional: without it the library uses
   a synchronous in-thread fallback.
 - `lazerDefaultsUrl` — injectable base URL for the default fallback hitsounds
-  (shipped at `../../assets/lazer-defaults/`).
+  and mod icons (shipped at `../../assets/lazer-defaults/`).
+- `storyboard: true` / `video: true` — opt in to loading and drawing the
+  beatmap's storyboard and video. The bundled sample map has neither; swap in
+  a `.osz` that does to see them.
 - `session.renderer.options` — a plain mutable object; flip flags like
-  `showJudgement` / `showKeyOverlay` / `showURBar` at any time to toggle HUD
-  layers.
+  `showJudgement` / `showKeyOverlay` / `showURBar` / `showStoryboard` at any
+  time to toggle HUD and storyboard layers.
 - `session.audioSync` — live audio controls: `setSongVolume` /
   `setEffectsVolume` (0..1), `setBeatmapHitsounds` (beatmap samples vs.
   skin-only), `setUserRate` (0.1..2 playback-rate multiplier on top of the mod

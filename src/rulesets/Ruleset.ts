@@ -46,6 +46,19 @@ export interface Ruleset<Session> {
   ): void;
 
   /**
+   * Optional second pass for elements osu! draws above the storyboard's Overlay layer but
+   * below the shared HUD — the cursor and the key overlay (lazer proxies the cursor above the
+   * HUD and the key overlay is HUD). The Renderer calls it right after that layer, so a
+   * storyboard that covers the playfield never hides the player's input. Same contract as `draw`.
+   */
+  drawAboveStoryboard?(
+    ctx: CanvasRenderingContext2D,
+    session: Session,
+    timeMs: number,
+    options: RenderOptions,
+  ): void;
+
+  /**
    * All hit judgements, sorted by time. One entry per judged event (including
    * auto-misses); rulesets may include auxiliary entries flagged `comboIgnore`
    * (e.g. taiko drum-roll ticks) that carry sound/animation but no accuracy.

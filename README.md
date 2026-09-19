@@ -6,15 +6,15 @@ frames; and renders synchronized gameplay + audio onto a canvas.
 
 - **All four rulesets** — osu!standard, taiko, catch, mania.
 - **Stable and lazer replays**, with mod support: HD, HR/EZ, DT/HT/NC (real
-  audio time-stretch, pitch-correct for DT/HT), FL, and more.
+  audio time-stretch, pitch-correct for DT/HT), FL, MR, and more.
+- **Storyboards and beatmap video** — opt-in, rendered in sync with gameplay.
 - **Headless analysis** — judge a replay and compute score/accuracy/combo/UR
-  timelines with no canvas, skin, or audio (works in Node): stats sites, bots.
-- **Auto replays** — synthesize a perfect play for any beatmap, no `.osr` needed.
-- **Zero runtime dependencies** — `dist/index.js` is a single self-contained
-  ES-module bundle.
+  timelines with no canvas, skin, or audio.
+- **Auto replays** — synthesize a perfect play for any beatmap.
+- **Zero runtime dependencies**
 
 This is the engine behind [replayviewer.com](https://replayviewer.com). The
-code here is generated from an upstream source-of-truth repository, so please
+code here is generated from an upstream repository that I run the site out of, so please
 file issues rather than pull requests against `src/`.
 
 ## Install
@@ -35,20 +35,16 @@ npm install
 npm run build     # → dist/index.js + dist/stretch-worker.js + d.ts tree
 ```
 
-Then try the examples (plain HTML pages + ES modules, no bundler — sample
-replay/beatmap assets and a skin are included, so they run out of the box):
+Then try the examples (sample replay/beatmap assets and a skin are included):
 
 - [`examples/minimal/`](examples/minimal/) — load a replay + beatmap + skin
   and play it back.
 - [`examples/dual/`](examples/dual/) — two replays of the same map side by
   side, clock-locked to one audio timeline.
 - [`examples/embed/`](examples/embed/) — skip the library entirely and embed
-  replayviewer.com in an iframe via postMessage.
+  replayviewer.com in an iframe. postMessage protocol available for more advanced usage.
 
 ## Dependencies
-
-Everything is a `devDependency` — the three runtime libraries are bundled into
-`dist/index.js`, so consumers install nothing else:
 
 - `lzma` — decodes the LZMA-compressed input-frame stream inside `.osr` replays.
 - `fflate` — unzips `.osz` beatmap sets and `.osk` skins.
@@ -57,15 +53,6 @@ Everything is a `devDependency` — the three runtime libraries are bundled into
 - `typescript` — type-checks and emits the `dist/` declaration tree.
 
 ## Usage
-
-Using a bundler, import the package directly. Without one, map the bare
-specifier to the installed file with an import map:
-
-```html
-<script type="importmap">
-{ "imports": { "replayviewer-js": "./node_modules/replayviewer-js/dist/index.js" } }
-</script>
-```
 
 ```js
 import {
@@ -86,6 +73,8 @@ const session = await createReplaySession({
   replay,
   beatmapSet: oszArrayBuffer,
   skin: buildSkin(skin, undefined, { mode: replay.mode }),
+  storyboard: true,       // optional: parse + draw the beatmap's storyboard
+  video: true,            // optional: also play the beatmap video (needs a DOM)
 });
 
 // Start playback: anchor the player's clock to the audio timeline, then go.
@@ -101,16 +90,13 @@ session.destroy();
 
 ## API overview
 
-Everything is exported from the single entry point (`dist/index.js`, fully
-typed by `dist/index.d.ts`). Three tiers:
-
 **Parsing**
 
-- `parseReplay(ArrayBuffer)` — decode a `.osr` (including the LZMA input-frame
-  stream) into `ReplayData`.
+- `parseReplay(ArrayBuffer)` — decode a `.osr` into `ReplayData`.
 - `parseBeatmap(text)` — decode a `.osu` into `BeatmapData`.
-- `loadBeatmapSet(ArrayBuffer)` / `extractBeatmapBackground(...)` — unpack a
-  `.osz` beatmap set.
+- `loadBeatmapSet(ArrayBuffer, options?)` / `extractBeatmapBackground(...)` —
+  unpack a `.osz` beatmap set; `options.storyboard` / `options.video` also
+  load the storyboard and video.
 - `loadSkin(...)` / `loadSkinFromDir(url)` / `mergeSkinAssets(...)` — skin
   loading (see [Skins](#skins)).
 - `md5(bytes)` — the hash osu! uses to match replays to beatmaps.
@@ -120,7 +106,7 @@ typed by `dist/index.d.ts`). Three tiers:
 - `analyzeReplay(beatmap, replay)` — dispatches on the replay's ruleset and
   returns `{ mode, modDiff, hitResults, scoreFrames, accFrames, comboFrames,
   urTimeline }`.
-- `computeModDifficulty(...)`, `applyStacking(...)` — the pieces it's built on.
+- `computeModDifficulty(...)`, `applyStacking(...)` — helpers.
 - Ruleset conversions consumers may need alongside the analysis outputs:
   `convertBeatmapToMania`, `convertBeatmapToCatch`, `applyPositionOffsets`, …
 
@@ -137,14 +123,22 @@ typed by `dist/index.d.ts`). Three tiers:
 - `configureWorkers({ stretch })` — inject the worker bundle URL for
   off-thread DT/HT audio stretching.
 
+**Storyboards**
+
+- Pass `storyboard: true` (and optionally `video: true`) to
+  `createReplaySession` to load and draw the beatmap's storyboard;
+  `RenderOptions.showStoryboard` / `showVideo` toggle the layers live, and
+  `session.videoStatus` reports whether the video can play.
+- `parseStoryboard(...)` + the `Storyboard*` types — the parsed model, for
+  consumers that want the storyboard without the renderer.
+
 ## Skins
 
 A skin is a required input to `createReplaySession`. This repo ships one ready
-to use — the YUGEN skin, pre-extracted at `assets/skin/` (the examples load
-it from there) — plus osu!'s 12 default fallback hitsounds at
-`assets/lazer-defaults/` (pass their base URL as
-`ReplaySessionInputs.lazerDefaultsUrl`; without them a synthesized fallback
-click is used when a sample is missing from the skin).
+to use, pre-extracted at `assets/skin/` (the examples load it from there),
+plus osu!'s default assets at `assets/lazer-defaults/`: the fallback hitsounds
+and the lazer-style mod-icon textures. Point `lazerDefaultsUrl` at that
+directory when calling `createReplaySession`.
 
 `loadSkinFromDir(baseUrl)` consumes a static directory of pre-extracted skin
 files with an `index.json` manifest:
@@ -163,9 +157,7 @@ files with an `index.json` manifest:
 node scripts/extract-skin.mjs "My Skin.osk" path/to/skin-dir
 ```
 
-The script needs `fflate` — running `npm install` in a clone of this repo
-covers it (it's a devDependency); if you copied the script next to an
-npm-installed package instead, `npm install fflate` alongside it.
+The script needs `fflate`
 
 ## Credits
 
@@ -173,13 +165,13 @@ npm-installed package instead, `npm install fflate` alongside it.
   ruleset (judgement behavior, mod formulas, and much of the renderer's
   animation/layout detail) was built with danser as the reference
   implementation and validated against it.
-- [ppy/osu](https://github.com/ppy/osu) — the taiko, catch, and mania rulesets
-  were built and validated against osu! lazer's reference implementation.
+- [ppy/osu](https://github.com/ppy/osu) — most features were built and validated 
+  against osu! lazer or directly ported to TypeScript from it.
 
 ## License
 
-[MIT](LICENSE) — covers the code. The bundled sample assets are not ours:
-the default hitsounds in `assets/lazer-defaults/` come from
+[MIT](LICENSE) The bundled sample assets are not ours:
+the default hitsounds and mod-icon textures in `assets/lazer-defaults/` come from
 [ppy/osu-resources](https://github.com/ppy/osu-resources) (CC BY-NC 4.0), and
 the skin, beatmaps, and replays under `assets/` and `examples/*/assets/`
 belong to their respective creators and are included as sample data only.

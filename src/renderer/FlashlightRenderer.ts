@@ -1,15 +1,9 @@
 import type { BeatmapData, ReplayData, HitResult, ReplayFrame } from '../types/index';
 import type { ModDifficulty } from '../utils/modDifficulty';
 import { computeComboTimeline } from './HUDRenderer';
+import { CANVAS_W, CANVAS_H, SCALE, OFFSET_X, OFFSET_Y } from './playfield';
 
 // Must match HitObjectRenderer / CursorRenderer.
-const CANVAS_W = 1280;
-const CANVAS_H = 720;
-const PLAYFIELD_W = 512;
-const PLAYFIELD_H = 384;
-const SCALE = Math.min(800 / PLAYFIELD_W, 600 / PLAYFIELD_H) * 0.9;
-const OFFSET_X = (CANVAS_W - PLAYFIELD_W * SCALE) / 2;
-const OFFSET_Y = (CANVAS_H - PLAYFIELD_H * SCALE) / 2;
 
 // osu!stable / Danser values.
 const DEFAULT_FL_SIZE      = 168;    // osu! pixels

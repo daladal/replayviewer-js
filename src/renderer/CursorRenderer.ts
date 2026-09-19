@@ -1,4 +1,5 @@
 import type { ReplayData, ReplayFrame, SkinAssets } from '../types/index';
+import { SCALE, OFFSET_X, OFFSET_Y } from './playfield';
 
 // Per-replay cumulative-time cache; WeakMap keeps it GC-safe.
 const _cumTimes = new WeakMap<ReplayFrame[], number[]>();
@@ -19,11 +20,6 @@ function getCumulativeTimes(frames: ReplayFrame[]): number[] {
 
 const TRAIL_LENGTH = 10;
 const CURSOR_RADIUS = 6; // primitive fallback only
-
-// Must match HitObjectRenderer.
-const SCALE = Math.min(800 / 512, 600 / 384) * 0.9;
-const OFFSET_X = (1280 - 512 * SCALE) / 2;
-const OFFSET_Y = (720 - 384 * SCALE) / 2;
 
 // osu! draws every cursor-system sprite (cursor, cursormiddle, cursortrail) at
 // "screen scale": each sprite's native @2x-adjusted size with the playfield's

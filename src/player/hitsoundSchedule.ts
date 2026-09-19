@@ -10,6 +10,7 @@
 import type { BeatmapData, HitResult, HitSample, TimingPoint } from '../types/index.js';
 import type { ComboFrame } from '../renderer/HUDRenderer.js';
 import type { TaikoInputEvent } from '../rulesets/taiko/input.js';
+import type { StoryboardSample } from '../storyboard/types.js';
 import { slideDurationMs } from '../utils/sliderDuration.js';
 
 const AUDIO_EXTS = ['.wav', '.mp3', '.ogg'];
@@ -44,11 +45,19 @@ function scheduleComboBreaks(
 
 const SET_NAMES: Record<number, string> = { 1: 'normal', 2: 'soft', 3: 'drum' };
 
+// A storyboard sample still starts when playback lands this far past its start time
+// (DrawableStoryboardSample.allowable_late_start); any later and it is skipped rather than
+// joined mid-way, so a seek never layers long-running samples from far back.
+const STORYBOARD_LATE_START_MS = 100;
+
 /** Floor applied to hit-object sample volume (DrawableHitObject.MINIMUM_SAMPLE_VOLUME = 5). */
 const MINIMUM_SAMPLE_VOLUME = 5;
 
-/** Kind of sound in the schedule: the four hit-sample stems, plus the two skin-only effects. */
-export type PendingSoundType = 'normal' | 'whistle' | 'finish' | 'clap' | 'combobreak' | 'spinnerbonus';
+/**
+ * Kind of sound in the schedule: the four hit-sample stems, the two skin-only effects, and a
+ * storyboard `Sample` event (`customFile` = its storyboard path, `sampleSet`/`sampleIndex` 0).
+ */
+export type PendingSoundType = 'normal' | 'whistle' | 'finish' | 'clap' | 'combobreak' | 'spinnerbonus' | 'storyboard';
 
 /**
  * One scheduled sound: when (beatmap ms, `oldOffsetMs` already applied) plus the resolved
@@ -62,7 +71,8 @@ export interface PendingSound {
   sampleIndex: number;
   customFile: string;
   // Playback gain 0..1. Undefined ⇒ full (1). Set for every hit sample (object/
-  // timing-point sample volume with a 5% floor); combobreak leaves it full.
+  // timing-point sample volume with a 5% floor) and every storyboard sample (its own
+  // volume, no floor); combobreak leaves it full.
   volume?: number;
 }
 
@@ -84,6 +94,9 @@ export interface HitsoundScheduleInputs {
   // Only schedule sounds at/after this beatmap time (live playback skips the past). Pass
   // a very negative value (e.g. -Infinity) to get the full schedule for offline export.
   fromBeatmapMs: number;
+  // Storyboard `Sample` events to play (see `playableStoryboardSamples`), or null/absent when
+  // the map has none or the storyboard is switched off.
+  storyboardSamples?: readonly StoryboardSample[] | null;
 }
 
 /**
@@ -111,8 +124,26 @@ export function computeHitsoundSchedule(input: HitsoundScheduleInputs): PendingS
   // every mode from the displayed combo timeline.
   scheduleComboBreaks(sounds, comboFrames, oldOffsetMs, fromBeatmapMs);
 
+  if (input.storyboardSamples != null) scheduleStoryboardSamples(sounds, input.storyboardSamples, fromBeatmapMs);
+
   sounds.sort((a, b) => a.beatmapMs - b.beatmapMs);
   return sounds;
+}
+
+// Storyboard samples play at their own map time (no `oldOffsetMs`: they are not tied to a
+// visual hit), at their own volume with no floor (a `Sample,…,0` line is silent, so it is
+// dropped here), and start late only within STORYBOARD_LATE_START_MS of a seek.
+function scheduleStoryboardSamples(
+  sounds: PendingSound[],
+  samples: readonly StoryboardSample[],
+  fromBeatmapMs: number,
+): void {
+  for (const s of samples) {
+    if (s.timeMs < fromBeatmapMs - STORYBOARD_LATE_START_MS) continue;
+    const volume = Math.max(0, Math.min(100, s.volume)) / 100;
+    if (volume === 0) continue;
+    sounds.push({ beatmapMs: s.timeMs, type: 'storyboard', sampleSet: 0, sampleIndex: 0, customFile: s.path, volume });
+  }
 }
 
 function scheduleStd(
@@ -146,9 +177,7 @@ function scheduleStd(
     const volume      = sampleGain(hs.volume, tp.volume);
 
     sounds.push({ beatmapMs, type: 'normal', sampleSet: normalSet, sampleIndex, customFile, volume });
-    if (bitmask & 2) sounds.push({ beatmapMs, type: 'whistle', sampleSet: additionSet, sampleIndex, customFile, volume });
-    if (bitmask & 4) sounds.push({ beatmapMs, type: 'finish',  sampleSet: additionSet, sampleIndex, customFile, volume });
-    if (bitmask & 8) sounds.push({ beatmapMs, type: 'clap',    sampleSet: additionSet, sampleIndex, customFile, volume });
+    pushAdditions(sounds, beatmapMs, bitmask, additionSet, sampleIndex, volume);
   }
 
   // Slider edge completions (slides 1..N); slide 0 covered by hitResults.
@@ -174,9 +203,7 @@ function scheduleStd(
       const volume      = sampleGain(obj.hitSample.volume, tp.volume);
 
       sounds.push({ beatmapMs, type: 'normal', sampleSet: normalSet, sampleIndex, customFile, volume });
-      if (bitmask & 2) sounds.push({ beatmapMs, type: 'whistle', sampleSet: additionSet, sampleIndex, customFile, volume });
-      if (bitmask & 4) sounds.push({ beatmapMs, type: 'finish',  sampleSet: additionSet, sampleIndex, customFile, volume });
-      if (bitmask & 8) sounds.push({ beatmapMs, type: 'clap',    sampleSet: additionSet, sampleIndex, customFile, volume });
+      pushAdditions(sounds, beatmapMs, bitmask, additionSet, sampleIndex, volume);
     }
   }
 
@@ -231,14 +258,13 @@ function scheduleMania(
     // ManiaLegacySkinTransformer.GetSample silences the auto-layered hitnormal on
     // mania-native maps (lazer's LegacyBeatmapDecoder layers a hitnormal under every
     // addition; mania-native plays only the addition). Mirror that: when whistle/clap/
-    // finish is set, suppress normal — otherwise play normal as the sole sample.
+    // finish is set, suppress normal — otherwise play normal as the sole sample. A custom
+    // file (FileHitSampleInfo) is never layered, so it always plays.
     const hasAddition = (bitmask & (2 | 4 | 8)) !== 0;
-    if (!hasAddition) {
+    if (!hasAddition || customFile !== '') {
       sounds.push({ beatmapMs, type: 'normal', sampleSet: normalSet, sampleIndex, customFile, volume });
     }
-    if (bitmask & 2) sounds.push({ beatmapMs, type: 'whistle', sampleSet: additionSet, sampleIndex, customFile, volume });
-    if (bitmask & 4) sounds.push({ beatmapMs, type: 'finish',  sampleSet: additionSet, sampleIndex, customFile, volume });
-    if (bitmask & 8) sounds.push({ beatmapMs, type: 'clap',    sampleSet: additionSet, sampleIndex, customFile, volume });
+    pushAdditions(sounds, beatmapMs, bitmask, additionSet, sampleIndex, volume);
   }
 }
 
@@ -278,9 +304,7 @@ function scheduleCatch(
     const volume      = sampleGain(hs.volume, tp.volume);
 
     sounds.push({ beatmapMs, type: 'normal', sampleSet: normalSet, sampleIndex, customFile, volume });
-    if (bitmask & 2) sounds.push({ beatmapMs, type: 'whistle', sampleSet: additionSet, sampleIndex, customFile, volume });
-    if (bitmask & 4) sounds.push({ beatmapMs, type: 'finish',  sampleSet: additionSet, sampleIndex, customFile, volume });
-    if (bitmask & 8) sounds.push({ beatmapMs, type: 'clap',    sampleSet: additionSet, sampleIndex, customFile, volume });
+    pushAdditions(sounds, beatmapMs, bitmask, additionSet, sampleIndex, volume);
   }
 }
 
@@ -336,7 +360,7 @@ function scheduleTaiko(
     // Strong (finish bit, 4) overlays the finisher boom: big-kat → 'whistle',
     // big-don → 'finish' (taiko's two distinct finisher sounds).
     if ((result.hitSound & 4) !== 0) {
-      sounds.push({ beatmapMs, type: isKat ? 'whistle' : 'finish', sampleSet: additionSet, sampleIndex, customFile, volume });
+      sounds.push({ beatmapMs, type: isKat ? 'whistle' : 'finish', sampleSet: additionSet, sampleIndex, customFile: '', volume });
     }
   }
 
@@ -359,21 +383,34 @@ function scheduleTaiko(
   }
 }
 
+// Whistle/finish/clap additions per the hitSound bitmask
+function pushAdditions(
+  sounds: PendingSound[],
+  beatmapMs: number,
+  bitmask: number,
+  additionSet: number,
+  sampleIndex: number,
+  volume: number,
+): void {
+  if (bitmask & 2) sounds.push({ beatmapMs, type: 'whistle', sampleSet: additionSet, sampleIndex, customFile: '', volume });
+  if (bitmask & 4) sounds.push({ beatmapMs, type: 'finish',  sampleSet: additionSet, sampleIndex, customFile: '', volume });
+  if (bitmask & 8) sounds.push({ beatmapMs, type: 'clap',    sampleSet: additionSet, sampleIndex, customFile: '', volume });
+}
+
 function activeTimingPoint(
   beatmap: BeatmapData,
   beatmapMs: number,
 ): Pick<TimingPoint, 'sampleSet' | 'sampleIndex' | 'volume'> {
   const tps = beatmap.timingPoints;
-  let sampleSet   = 1;
-  let sampleIndex = 0;
-  let volume      = 100;
-  for (const tp of tps) {
-    if (tp.time > beatmapMs) break;
-    sampleSet   = tp.sampleSet   || 1; // 0=auto → normal (1)
-    sampleIndex = tp.sampleIndex;
-    volume      = tp.volume;
+  let lo = 0;
+  let hi = tps.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (tps[mid]!.time <= beatmapMs) lo = mid + 1; else hi = mid;
   }
-  return { sampleSet, sampleIndex, volume };
+  if (lo === 0) return { sampleSet: 1, sampleIndex: 0, volume: 100 };
+  const tp = tps[lo - 1]!;
+  return { sampleSet: tp.sampleSet || 1, sampleIndex: tp.sampleIndex, volume: tp.volume }; // 0=auto → normal (1)
 }
 
 // Sample playback gain 0..1. The object's own sample volume wins when > 0, else the
@@ -388,7 +425,12 @@ function sampleGain(hitSampleVolume: number, tpVolume: number): number {
 export interface SampleResolverDeps {
   // 0 = std, 1 = taiko, 2 = catch, 3 = mania. Taiko uses a taiko-prefixed-only lookup.
   mode: 0 | 1 | 2 | 3;
+  // The user skin's sounds alone — no beatmap samples merged in.
   skinSounds: ReadonlyMap<string, AudioBuffer>;
+  // The beatmap archive's own audio files (custom-named samples + `{set}-hit{type}{N}`
+  // overrides), or null when "beatmap hitsounds" is off. Consulted before the skin, under
+  // osu!'s custom-index rules (see `resolveSample`).
+  beatmapSounds: ReadonlyMap<string, AudioBuffer> | null;
   // Lazer-default hitsounds (the ppy/osu-resources wavs); cascade fallback below
   // skin lookups, above synth. Null when not loaded.
   lazerDefaultSounds: ReadonlyMap<string, AudioBuffer> | null;
@@ -411,9 +453,95 @@ export function lookupSkinSound(
 }
 
 /**
- * Resolve one sample identity to an AudioBuffer. Lookup order: custom file →
- * {set}-hit{type}{idx} → {set}-hit{type} → hit{type}{idx} → lazer-default → synth
- * (never returns null — the synth fallback always produces a buffer).
+ * Skin-effect sample (combobreak, spinnerbonus): a beatmap-shipped file wins over the skin's
+ * when beatmap hitsounds are on (`beatmapSounds` non-null), as with the beatmap skin in osu!.
+ */
+export function lookupEffectSound(
+  skinSounds: ReadonlyMap<string, AudioBuffer>,
+  beatmapSounds: ReadonlyMap<string, AudioBuffer> | null,
+  basename: string,
+): AudioBuffer | null {
+  if (beatmapSounds !== null) {
+    const buf = lookupSkinSound(beatmapSounds, basename);
+    if (buf !== null) return buf;
+  }
+  return lookupSkinSound(skinSounds, basename);
+}
+
+/**
+ * Look up a beatmap-specified custom sample filename (`HitSample.filename`) in the beatmap's
+ * sounds. The `.osu` field carries an extension (`piano_c4.wav`) and arbitrary casing, while
+ * the sound map is keyed by lowercased basename, so: strip any directory prefix, lowercase,
+ * try the name as written, then drop a trailing `.wav`/`.mp3`/`.ogg` and walk the extension
+ * order (osu! looks up both the filename and its extension-less stem, so a `foo.wav` reference
+ * still finds an archive's `foo.ogg`).
+ */
+export function lookupCustomSound(
+  beatmapSounds: ReadonlyMap<string, AudioBuffer>,
+  filename: string,
+): AudioBuffer | null {
+  const basename = (filename.split(/[\\/]/).pop() ?? filename).toLowerCase();
+  const exact = beatmapSounds.get(basename);
+  if (exact !== undefined) return exact;
+  const stem = basename.replace(/\.(wav|mp3|ogg)$/, '');
+  if (stem === '') return null;
+  return lookupSkinSound(beatmapSounds, stem);
+}
+
+/**
+ * Resolve a storyboard `Sample` path. The beatmap map is keyed by lowercased full archive path
+ * as well as basename, so: the path as written (`\\` → `/`, lowercased), then its stem with
+ * `.wav`/`.mp3`/`.ogg` (`StoryboardSampleInfo.LookupNames` tries the name and the name without
+ * its extension), then the basename cascade of `lookupCustomSound`, then the user skin by
+ * basename (lazer's `SkinnableSound` falls through to it). Null ⇒ silent; there is no synth proxy.
+ * Independent of the "Beatmap Hitsounds" toggle — the storyboard owns these files.
+ */
+export function lookupStoryboardSample(
+  beatmapSounds: ReadonlyMap<string, AudioBuffer>,
+  skinSounds: ReadonlyMap<string, AudioBuffer>,
+  path: string,
+): AudioBuffer | null {
+  const full = path.replace(/\\/g, '/').toLowerCase();
+  const exact = beatmapSounds.get(full);
+  if (exact !== undefined) return exact;
+  const stem = full.replace(/\.(wav|mp3|ogg)$/, '');
+  if (stem !== '') {
+    const byStem = lookupSkinSound(beatmapSounds, stem);
+    if (byStem !== null) return byStem;
+  }
+  return lookupCustomSound(beatmapSounds, full) ?? lookupCustomSound(skinSounds, full);
+}
+
+function firstSound(
+  sounds: ReadonlyMap<string, AudioBuffer>,
+  names: readonly string[],
+): AudioBuffer | null {
+  for (const name of names) {
+    const buf = lookupSkinSound(sounds, name);
+    if (buf !== null) return buf;
+  }
+  return null;
+}
+
+/**
+ * Resolve one sample identity to an AudioBuffer (never null — the synth fallback always
+ * produces a buffer). Mirrors osu!'s beatmap-skin → user-skin → default cascade:
+ *
+ * 1. `customFile` (set only on the hitnormal slot) → the beatmap's file by name. If the file
+ *    is missing, or beatmap hitsounds are off, the sample degrades to a plain `normal-hitnormal`
+ *    (bank "normal", no custom index — how lazer's FileHitSampleInfo falls back), not to the
+ *    object's bank.
+ * 2. Beatmap sounds, only when the custom index is ≥ 1: `{set}-hit{type}{N}` (suffix only for
+ *    N ≥ 2, and then mandatory — a `soft-hitnormal3` section never falls back to the beatmap's
+ *    `soft-hitnormal`), then the bare "universal" `hit{type}`. Index 0 never reads beatmap files,
+ *    even when the archive ships `{set}-hit{type}`.
+ * 3. User skin, which never uses the custom index: `{set}-hit{type}` → `hit{type}`.
+ * 4. Lazer-default `{set}-hit{type}` → synth.
+ *
+ * Taiko prefixes every name with `taiko-` and never falls through to non-prefixed names
+ * (lazer's LegacyTaikoSampleInfo strips them), so a skin without taiko-*-hit*.wav never plays
+ * its standard hitsounds; provide a skin baseline that ships taiko-{normal,soft}-hit* if the
+ * synth fallback should never be heard.
  */
 export function resolveSample(
   type: 'normal' | 'whistle' | 'finish' | 'clap',
@@ -422,49 +550,38 @@ export function resolveSample(
   customFile: string,
   deps: SampleResolverDeps,
 ): AudioBuffer {
-  const { mode, skinSounds, lazerDefaultSounds, synthCache, ctx } = deps;
+  const { mode, skinSounds, beatmapSounds, lazerDefaultSounds, synthCache, ctx } = deps;
 
+  let set = sampleSet;
+  let idx = sampleIndex;
   if (customFile !== '') {
-    const buf = lookupSkinSound(skinSounds, customFile);
-    if (buf !== null) return buf;
-    return synthBuffer(type, ctx, synthCache);
-  }
-
-  const setName = SET_NAMES[sampleSet] ?? 'normal';
-  const suffix  = sampleIndex >= 2 ? String(sampleIndex) : '';
-
-  // Taiko lookup is taiko-prefixed only — lazer's LegacyTaikoSampleInfo strips
-  // non-prefixed names from LookupNames, so a skin without taiko-*-hit*.wav
-  // never falls through to its standard hitsounds. Provide a skin baseline that
-  // ships taiko-{normal,soft}-hit* if the synth fallback should never be heard.
-  if (mode === 1) {
-    let tbuf = lookupSkinSound(skinSounds, `taiko-${setName}-hit${type}${suffix}`);
-    if (tbuf !== null) return tbuf;
-    if (suffix !== '') {
-      tbuf = lookupSkinSound(skinSounds, `taiko-${setName}-hit${type}`);
-      if (tbuf !== null) return tbuf;
+    if (beatmapSounds !== null) {
+      const buf = lookupCustomSound(beatmapSounds, customFile);
+      if (buf !== null) return buf;
     }
-    tbuf = lookupSkinSound(skinSounds, `taiko-hit${type}`);
-    if (tbuf !== null) return tbuf;
-    return synthBuffer(type, ctx, synthCache);
+    set = 1;
+    idx = 0;
   }
 
-  let buf = lookupSkinSound(skinSounds, `${setName}-hit${type}${suffix}`);
-  if (buf !== null) return buf;
+  const setName = SET_NAMES[set] ?? 'normal';
+  const suffix  = idx >= 2 ? String(idx) : '';
+  const prefix  = mode === 1 ? 'taiko-' : '';
 
-  if (suffix !== '') {
-    buf = lookupSkinSound(skinSounds, `${setName}-hit${type}`);
+  if (beatmapSounds !== null && idx >= 1) {
+    const buf = firstSound(beatmapSounds, [`${prefix}${setName}-hit${type}${suffix}`, `${prefix}hit${type}`]);
     if (buf !== null) return buf;
   }
 
-  buf = lookupSkinSound(skinSounds, `hit${type}${suffix}`);
+  const buf = firstSound(skinSounds, [`${prefix}${setName}-hit${type}`, `${prefix}hit${type}`]);
   if (buf !== null) return buf;
 
-  // Real lazer-default fallback (ppy/osu-resources baseline). Sits between skin lookups
-  // and synth so a skin that's missing a specific sample (common on mania-only skins)
-  // gets the actually-default sound instead of a sine-wave proxy.
-  const lz = lazerDefaultSounds?.get(`${setName}-hit${type}.wav`);
-  if (lz !== undefined) return lz;
+  if (mode !== 1) {
+    // Real lazer-default fallback (ppy/osu-resources baseline). Sits between skin lookups
+    // and synth so a skin that's missing a specific sample (common on mania-only skins)
+    // gets the actually-default sound instead of a sine-wave proxy.
+    const lz = lazerDefaultSounds?.get(`${setName}-hit${type}.wav`);
+    if (lz !== undefined) return lz;
+  }
 
   return synthBuffer(type, ctx, synthCache);
 }

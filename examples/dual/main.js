@@ -79,6 +79,8 @@ async function buildSessions() {
       showFollowpoints: true,
       showURBar:        true,
       showModIcons:     true,
+      showStoryboard:   true,
+      showVideo:        true,
     });
     s.renderer.start();
   }

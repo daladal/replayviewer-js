@@ -94,6 +94,15 @@ export interface ModDifficulty {
   // Mania-specific mods. isHD (Hidden) and isFL (Flashlight) reuse the shared
   // flags; the mania ruleset interprets them with mania semantics (cover / band).
   readonly isMirror: boolean;
+  /**
+   * osu!std playfield reflection, applied at render/query time (raw positions are never
+   * mutated; stacking runs on the originals and its offset is applied after the flip, which
+   * matches lazer reflecting before stacking): `flipX` maps `x → 512 − x`, `flipY` maps
+   * `y → 384 − y`. HR sets `flipY`; Mirror sets them per its `reflection` setting
+   * (Horizontal → X, Vertical → Y, Both → X + Y). Only std reads these.
+   */
+  readonly flipX: boolean;
+  readonly flipY: boolean;
   // FadeIn — mania cover mod (notes appear out of nowhere; spawn-side cover).
   readonly isFadeIn: boolean;
   // Cover (CO) — lazer-only configurable mania cover.
@@ -176,6 +185,8 @@ export function computeModDifficulty(beatmap: BeatmapData, replay: ReplayData): 
   let isHR = false, isEZ = false, isDT = false, isHT = false, isNC = false, isHD = false, isFL = false;
   let isNF = false, isSD = false, isPF = false, isAC = false;
   let isMirror = false, isFadeIn = false, isCover = false;
+  // osu!std Mirror `reflection`: 0 = Horizontal (default), 1 = Vertical, 2 = Both.
+  let mirrorReflection = 0;
   let coverCoverage = 0.5, coverAlong = true;
   // Mania flat window multiplier (ManiaModHardRock/Easy set HitWindows.DifficultyMultiplier;
   // OD itself is NOT scaled in mania). HR = 1.4, EZ = 1/1.4, default 1.
@@ -248,7 +259,14 @@ export function computeModDifficulty(beatmap: BeatmapData, replay: ReplayData): 
         }
         case 'HD': isHD = true; break;
         case 'FL': isFL = true; break;
-        case 'MR': isMirror = true; break;
+        case 'MR': {
+          isMirror = true;
+          // Serialises as the enum ordinal or its name; lazer omits the default (Horizontal).
+          const refl = mod.settings?.['reflection'];
+          if (typeof refl === 'number') mirrorReflection = refl;
+          else if (typeof refl === 'string') mirrorReflection = /both/i.test(refl) ? 2 : /vertical/i.test(refl) ? 1 : 0;
+          break;
+        }
         case 'FI': isFadeIn = true; break;
         case 'CO': {
           isCover = true;
@@ -306,6 +324,9 @@ export function computeModDifficulty(beatmap: BeatmapData, replay: ReplayData): 
     if (hasMod(mods, 1 << 20)) isFadeIn = true;
     if (hasMod(mods, 1 << 30)) isMirror = true;
   }
+
+  const flipX = isMirror && (mirrorReflection === 0 || mirrorReflection === 2);
+  const flipY = isHR || (isMirror && (mirrorReflection === 1 || mirrorReflection === 2));
 
   const preempt = difficultyRate(ar, 1800, 1200, 450);
   const fadeIn = 400 * Math.min(1, preempt / 450);
@@ -401,6 +422,7 @@ export function computeModDifficulty(beatmap: BeatmapData, replay: ReplayData): 
     isHR, isEZ, isDT, isHT, isNC, isHD, isFL,
     isNF, isSD, isPF, isAC,
     isMirror, isFadeIn, isCover, coverCoverage, coverAlong,
+    flipX, flipY,
     isLazer, isCL,
     lzNoSliderAcc, lzLegacyNotelock, lzLegacySound, lzLegacyHP,
   };

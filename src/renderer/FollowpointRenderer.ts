@@ -2,15 +2,9 @@ import type { BeatmapData, HitObject, SkinAssets } from '../types/index';
 import type { ModDifficulty } from '../utils/modDifficulty';
 import { sampleSlider } from './SliderGeometry';
 import { slideDurationMs } from '../utils/sliderDuration';
+import { SCALE, OFFSET_X, OFFSET_Y } from './playfield';
 
 // Must match HitObjectRenderer.
-const PLAYFIELD_W = 512;
-const PLAYFIELD_H = 384;
-const CANVAS_W = 1280;
-const CANVAS_H = 720;
-const SCALE = Math.min(800 / PLAYFIELD_W, 600 / PLAYFIELD_H) * 0.9;
-const OFFSET_X = (CANVAS_W - PLAYFIELD_W * SCALE) / 2;
-const OFFSET_Y = (CANVAS_H - PLAYFIELD_H * SCALE) / 2;
 
 function toCanvas(x: number, y: number): [cx: number, cy: number] {
   return [OFFSET_X + x * SCALE, OFFSET_Y + y * SCALE];
@@ -78,25 +72,25 @@ function resolveFollowpointArt(images: Map<string, ImageBitmap>): FollowpointArt
   return result;
 }
 
-function startPosStacked(obj: HitObject, radiusOsu: number, flipY: (y: number) => number): { x: number; y: number } | null {
+function startPosStacked(obj: HitObject, radiusOsu: number, flipX: (x: number) => number, flipY: (y: number) => number): { x: number; y: number } | null {
   if (obj.type === 'spinner') return null;
   const shift = -obj.stackHeight * radiusOsu / 10;
-  return { x: obj.x + shift, y: flipY(obj.y) + shift };
+  return { x: flipX(obj.x) + shift, y: flipY(obj.y) + shift };
 }
 
 // Slider end depends on slide parity: odd ends at tail, even ends back at head.
-function endPosStacked(obj: HitObject, radiusOsu: number, flipY: (y: number) => number): { x: number; y: number } | null {
+function endPosStacked(obj: HitObject, radiusOsu: number, flipX: (x: number) => number, flipY: (y: number) => number): { x: number; y: number } | null {
   if (obj.type === 'spinner') return null;
   if (obj.type === 'circle') {
     const shift = -obj.stackHeight * radiusOsu / 10;
-    return { x: obj.x + shift, y: flipY(obj.y) + shift };
+    return { x: flipX(obj.x) + shift, y: flipY(obj.y) + shift };
   }
   const path = sampleSlider(obj);
   const endPoint = (obj.slides % 2 === 1)
     ? path[path.length - 1]!
     : path[0]!;
   const shift = -obj.stackHeight * radiusOsu / 10;
-  return { x: endPoint.x + shift, y: flipY(endPoint.y) + shift };
+  return { x: flipX(endPoint.x) + shift, y: flipY(endPoint.y) + shift };
 }
 
 function objectEndTime(obj: HitObject, beatmap: BeatmapData): number {
@@ -123,7 +117,8 @@ export function drawFollowpoints(
 
   const radiusOsu   = modDiff.circleRadiusPx;
   const preempt     = modDiff.preemptMs;
-  const fy = modDiff.isHR ? (y: number) => 384 - y : (y: number) => y;
+  const fx = modDiff.flipX ? (x: number) => 512 - x : (x: number) => x;
+  const fy = modDiff.flipY ? (y: number) => 384 - y : (y: number) => y;
   const arScale     = Math.min(1, preempt / 450);
   const timeFadeIn  = HIT_FADE_IN  * arScale;
   const timeFadeOut = HIT_FADE_OUT * arScale;
@@ -177,8 +172,8 @@ export function drawFollowpoints(
     if (timeMs < Math.max(prevTime - PRE_EMPT, nextAppear)) continue;
     if (timeMs > nextTime + timeFadeOut) continue;
 
-    const prevPos = endPosStacked(prev, radiusOsu, fy);
-    const nextPos = startPosStacked(next, radiusOsu, fy);
+    const prevPos = endPosStacked(prev, radiusOsu, fx, fy);
+    const nextPos = startPosStacked(next, radiusOsu, fx, fy);
     if (prevPos === null || nextPos === null) continue;
 
     const dx = nextPos.x - prevPos.x;
@@ -216,9 +211,11 @@ export function drawFollowpoints(
       const osuY = prevPos.y + dy * t;
       const [cx, cy] = toCanvas(osuX, osuY);
 
-      const frameIdx = art.frames.length === 1
+      // timeMs is negative during a storyboard-led intro; keep the index in range either way.
+      const n = art.frames.length;
+      const frameIdx = n === 1
         ? 0
-        : Math.floor(timeMs / art.frameDurMs) % art.frames.length;
+        : ((Math.floor(timeMs / art.frameDurMs) % n) + n) % n;
       const frame = art.frames[frameIdx]!;
       const bmpDiv = frame.is2x ? 2 : 1;
       const drawW = (frame.bitmap.width  / bmpDiv) * sizeFactor;
